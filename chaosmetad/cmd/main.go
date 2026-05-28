@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"github.com/spf13/cobra"
+	"github.com/traas-stack/chaosmeta/chaosmetad/cmd/aidaemon"
 	"github.com/traas-stack/chaosmeta/chaosmetad/cmd/inject"
 	"github.com/traas-stack/chaosmeta/chaosmetad/cmd/query"
 	"github.com/traas-stack/chaosmeta/chaosmetad/cmd/recover"
@@ -46,6 +47,7 @@ func initRootCmd() {
 	rootCmd.AddCommand(recover.NewRecoverCommand())
 	rootCmd.AddCommand(server.NewServerCommand())
 	rootCmd.AddCommand(version.NewVersionCommand())
+	rootCmd.AddCommand(aidaemon.NewAIDaemonCommand())
 }
 
 func main() {

@@ -19,6 +19,7 @@ package inject
 import (
 	"github.com/spf13/cobra"
 	"github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector"
+	_ "github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector/ai"
 	_ "github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector/container"
 	_ "github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector/cpu"
 	_ "github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector/disk"
