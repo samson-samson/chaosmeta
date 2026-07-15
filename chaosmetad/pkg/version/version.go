@@ -23,6 +23,14 @@ import (
 	"github.com/traas-stack/chaosmeta/chaosmetad/pkg/log"
 )
 
+// Version / BuildDate 可在构建期用 -ldflags -X 注入（见 chaosmeta-ppu.Dockerfile）；
+// BuildDate 未注入时为空（避免展示字面占位 "@DATE@"）。Version 保留 @VERSION@ 占位以兼容
+// 历史 build/ci/build.sh 的 sed 注入（这两个机制并存，二者其一即可，结果一致）。
+var (
+	Version   = "@VERSION@"
+	BuildDate = ""
+)
+
 func PrintVersion(ctx context.Context) {
 	logger := log.GetLogger(ctx)
 	reBytes, _ := json.Marshal(GetVersion())
@@ -35,7 +43,7 @@ func PrintVersion(ctx context.Context) {
 
 func GetVersion() *Info {
 	return &Info{
-		Version:   "@VERSION@",
-		BuildDate: "@DATE@",
+		Version:   Version,
+		BuildDate: BuildDate,
 	}
 }

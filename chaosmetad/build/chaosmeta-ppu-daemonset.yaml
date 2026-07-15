@@ -1,0 +1,80 @@
+# chaosmeta daemon (PPU-enabled) — deployed into the zjsl dev cluster so the
+# chaosmeta-inject-operator (.control plane) can reach this node's chaosmetad
+# agent over HTTP (172.16.7.155:29595) and run PPU fault injection.
+#
+# PPU is host hardware (alixpu); the daemon stays host-only: hostPID/hostNetwork,
+# privileged, and copies its binaries into /tmp (host-mounted) before exec'ing,
+# mirroring the original chaosmeta daemon image contract (GetRunPath -> /tmp dir).
+#
+# Apply:
+#   KUBECONFIG=/Users/samson/wattlen/kubeconfigs/zjsl-cluster-dev.yaml \
+#     kubectl apply -f chaosmetad/build/chaosmeta-ppu-daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: chaosmeta-daemon
+  namespace: kube-system
+  labels:
+    app.chaosmeta.io: chaosmeta-daemon
+spec:
+  selector:
+    matchLabels:
+      app.chaosmeta.io: chaosmeta-daemon
+  template:
+    metadata:
+      labels:
+        app.chaosmeta.io: chaosmeta-daemon
+    spec:
+      nodeName: 307a012601.cloud.c04.yqidc   # PPU dev node (172.16.7.155)
+      tolerations:
+        - operator: Exists                    # edge node / any taint — single-node dev scope
+      hostPID: true
+      hostNetwork: true
+      # hostIPC intentionally NOT set: the PPU tool talks via ppu-smi/mount-ns,
+      # not shm; principle of least privilege on a node running live inference.
+      imagePullSecrets:                         # ACR (goodputai-registry) needs auth from this edge node
+        - name: ultron-acr-pull
+      containers:
+        - name: chaosmeta-daemon
+          image: goodputai-registry.cn-hangzhou.cr.aliyuncs.com/dev/chaosmetad-daemon:ppu-0.10
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          # Copy the (read-only) bundle into /tmp (host-mounted, writable)
+          # idempotently, then start the agent HTTP service on :29595.
+          # GET /v1/version is a real handler (returns 200 + version JSON) used
+          # as the liveness endpoint — chaosmetad has no /health.
+          command: ["/bin/bash", "-c"]
+          args:
+            - >-
+              rm -rf /tmp/chaosmetad-${CHAOSMETAD_VERSION}
+              && cp -r /opt/chaosmeta/chaosmetad-${CHAOSMETAD_VERSION} /tmp/chaosmetad-${CHAOSMETAD_VERSION}
+              && exec /tmp/chaosmetad-${CHAOSMETAD_VERSION}/chaosmetad server --addr 0.0.0.0 --port 29595 --log-level info
+          env:
+            - name: CHAOSMETAD_VERSION
+              value: "0.3.9"
+          ports:
+            - name: agent
+              containerPort: 29595
+              hostPort: 29595
+          livenessProbe:
+            httpGet:
+              path: /v1/version
+              port: 29595
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/version
+              port: 29595
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - mountPath: /tmp
+              name: chaosmeta-workdir
+      volumes:
+        - name: chaosmeta-workdir
+          hostPath:
+            path: /tmp
+            type: Directory

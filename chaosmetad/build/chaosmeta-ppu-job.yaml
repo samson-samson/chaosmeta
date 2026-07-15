@@ -1,0 +1,64 @@
+# Job-style PPU fault injection (替代 daemonset 常驻 agent，更轻)。
+#
+# 一次注入 = 一个 Job，跑完即退、自动清理；恢复时再起一个 recover job。
+# 不依赖常驻 agent / HTTP / sqlite / 探针；状态走 marker 文件（/tmp，hostPath）。
+#
+# 复用节点上已缓存的 chaosmetad-daemon:ppu-0.5 镜像（imagePullPolicy: IfNotPresent，
+# 不再打 registry——ACR token 已失效）。20-fault 的 chaosmeta_ppu 通过 daemon pod
+# 预先 cp 到宿主机 /tmp/ppu20/（hostPath 共享）；本 job 从 /tmp/ppu20/chaosmeta_ppu 跑。
+#
+# hostPID + privileged：nsenter -t 1 -m -u 进宿主机调 ppu-smi（PPU 是宿主机硬件）。
+# 用 env 注入故障参数：PPU_FAULT / PPU_METHOD(present: inject|recover|validator) / PPU_ARGS。
+#
+# 例子（kubectl create）：
+#   PPU_METHOD=inject PPU_FAULT=computemode PPU_ARGS="2 cm-job-1 1"  注入 card2 EXCLUSIVE_PROCESS
+#   PPU_METHOD=recover PPU_FAULT=computemode PPU_ARGS="cm-job-1"     恢复
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ppu-inject
+  namespace: kube-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 120
+  template:
+    spec:
+      nodeName: 307a012601.cloud.c04.yqidc   # PPU dev 节点
+      hostPID: true
+      hostNetwork: true
+      restartPolicy: Never
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: ppu-tool
+          image: goodputai-registry.cn-hangzhou.cr.aliyuncs.com/dev/chaosmetad-daemon:ppu-0.5
+          imagePullPolicy: IfNotPresent        # 用节点缓存，不打 registry
+          securityContext:
+            privileged: true
+          env:
+            - name: PPU_METHOD
+              value: "validator"
+            - name: PPU_FAULT
+              value: "computemode"
+            - name: PPU_ARGS
+              value: "2 1"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              TOOL=/tmp/ppu20/chaosmeta_ppu
+              [ -x "$TOOL" ] || { echo "tool missing at $TOOL (stage it via daemon pod first)"; exit 2; }
+              echo "[ppu-job] method=$PPU_METHOD fault=$PPU_FAULT args=$PPU_ARGS"
+              # nsenter 进宿主机跑 exec tool（PPU 是宿主机硬件；容器内无 ppu-smi）
+              nsenter -t 1 -m -u -- "$TOOL" "$PPU_METHOD" "$PPU_FAULT" info $PPU_ARGS
+              rc=$?
+              echo "[ppu-job] exit=$rc"
+              exit $rc
+          volumeMounts:
+            - mountPath: /tmp
+              name: hosttmp
+      volumes:
+        - name: hosttmp
+          hostPath:
+            path: /tmp
+            type: Directory

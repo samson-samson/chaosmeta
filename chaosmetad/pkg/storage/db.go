@@ -18,8 +18,8 @@ package storage
 
 import (
 	"fmt"
+	"github.com/glebarez/sqlite"
 	"github.com/traas-stack/chaosmeta/chaosmetad/pkg/utils"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 	"path"

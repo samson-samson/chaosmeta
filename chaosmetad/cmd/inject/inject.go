@@ -29,6 +29,7 @@ import (
 	_ "github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector/kernel"
 	_ "github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector/mem"
 	_ "github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector/network"
+	_ "github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector/ppu"
 	_ "github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector/process"
 )
 

@@ -61,6 +61,9 @@ TOOL_EXECNS="chaosmeta_execns"
 DISKIO_EXEC="chaosmeta_diskio"
 #MEM_EXEC="chaosmeta_mem"
 
+# PPU 故障注入内核工具：封装宿主机 ppu-smi 调用，注入只走宿主机路径
+PPU_EXEC="chaosmeta_ppu"
+
 # file path
 CI_DIR=$(
   cd $(dirname $0)
@@ -106,6 +109,12 @@ CGO_ENABLED=1 GOOS=${OS_NAME} GOARCH=${ARCH_NAME} ${GO_TOOL} build -o ${PACKAGE_
 #CGO_ENABLED=1 GOOS=${OS_NAME} GOARCH=${ARCH_NAME} ${GO_TOOL} build -o ${PACKAGE_DIR}/${OS_NAME}/tools/${NET_EXEC} ${EXEC_DIR}/network/${NET_EXEC}.go
 CGO_ENABLED=1 GOOS=${OS_NAME} GOARCH=${ARCH_NAME} ${GO_TOOL} build -o ${PACKAGE_DIR}/${OS_NAME}/tools/${DISKIO_EXEC} ${EXEC_DIR}/diskio/${DISKIO_EXEC}.go
 #CGO_ENABLED=1 GOOS=${OS_NAME} GOARCH=${ARCH_NAME} ${GO_TOOL} build -o ${PACKAGE_DIR}/${OS_NAME}/tools/${MEM_EXEC} ${EXEC_DIR}/mem/${MEM_EXEC}.go
+CGO_ENABLED=1 GOOS=${OS_NAME} GOARCH=${ARCH_NAME} ${GO_TOOL} build -o ${PACKAGE_DIR}/${OS_NAME}/tools/${PPU_EXEC} ${EXEC_DIR}/ppu/chaosmeta_ppu.go
+# PPU memfill 的 CUDA 内核工具 chaosmeta_ppumem 不在 CI 编译（需要 PPU 宿主机的 /opt/pg1
+# CUDA SDK + nvcc）。它在目标节点上用宿主机 nvcc 编译：
+#   PATH=/opt/pg1/CUDA_SDK/bin:$PATH nvcc -O2 chaosmeta_ppumem.cu -o chaosmeta_ppumem \
+#     -lcudart -L/opt/pg1/CUDA_SDK/lib64 -Wl,-rpath,/opt/pg1/CUDA_SDK/lib64
+# 然后连同 chaosmeta_ppu 一起放到 tools/。编译产物路径需与 chaosmeta_ppu 同目录（ppumemBinPath 依赖）。
 # CGO_ENABLED=1 GOOS=${OS_NAME} GOARCH=${ARCH_NAME} ${GO_TOOL} build -o ${PACKAGE_DIR}/${OS_NAME}/tools/${TOOL_EXECNS} ${PROJECT_DIR}/tools/${TOOL_EXECNS}.go
 
 javac -d ${PACKAGE_DIR}/${OS_NAME}/tools ${PROJECT_DIR}/tools/jvm/${JVM_ATTACHER}.java -cp ${PROJECT_DIR}/tools/jvm/lib/tools.jar:${PACKAGE_DIR}/${OS_NAME}/tools
