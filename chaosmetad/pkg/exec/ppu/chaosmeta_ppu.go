@@ -604,30 +604,39 @@ func injectMemFill(ctx context.Context, args []string) error {
 		return err
 	}
 	bin := ppumemBinPath()
-	var pids []string // 已托管（marker 已落地）的 ppumem pid；任何中途失败/崩溃后 recover 能据此清理
+	// entries 维护所有已托管卡的 "pid:start" 条目，每启动一张卡就立即落盘全量。
+	// 用单一切片而非每轮拼装，确保前序卡的 start 指纹不丢失（避免退化成裸 pid → recover 拒 kill）。
+	var entries []string
 	for _, id := range targetIds {
 		// nohup ppumem <id> <mb> &，全 LD_LIBRARY_PATH 保证 libhggcrt1.so 可加载。
-		inner := fmt.Sprintf("%s nohup %s %s %d >/dev/null 2>&1 & echo $!", ppumemFullLibPath, bin, id, mb)
+		// 同一条 shell 命令里**同时**取 pid 和 /proc/<pid>/stat 的启动时间（第 22 字段），
+		// 把"取 pid"和"取 start 指纹"压到一次 shell→Go 解析里，缩小 codex C1 的 start→persist 窗口。
+		inner := fmt.Sprintf(
+			"%s nohup %s %s %d >/dev/null 2>&1 & pid=$!; echo \"%s:${pid}:$(awk '{print $22}' /proc/${pid}/stat 2>/dev/null)\"",
+			ppumemFullLibPath, bin, id, mb, id,
+		)
 		out, err := runHostShell(ctx, inner)
 		if err != nil {
 			return fmt.Errorf("start ppumem for ppu[%s] error: %s; out: %s", id, err, out)
 		}
-		pid := strings.TrimSpace(out)
-		if pid == "" {
-			return fmt.Errorf("start ppumem for ppu[%s]: empty pid", id)
+		fields := strings.Split(strings.TrimSpace(out), ":")
+		if len(fields) < 3 || fields[1] == "" {
+			return fmt.Errorf("start ppumem for ppu[%s]: bad pid/start output: %q", id, out)
 		}
-		pids = append(pids, pid)
-		// 立即持久化"含启动时间指纹"的全量 PID 列表 —— 先把 PID 落盘，再做存活/分配校验。
-		// 这样无论后续校验、还是任何时机崩溃，marker 都已含本卡 ppumem，recover 能 kill 它，
-		// 杜绝"helper 起来了但 marker 没写"导致显存孤儿（codex 闭环复验 C1 start→persist 窗口）。
-		if werr := writeMarker(uid, strings.Join(pidWithStarts(ctx, pids), ",")); werr != nil {
+		pid, start := fields[1], fields[2]
+		pidStart := pid
+		if start != "" {
+			pidStart = pid + ":" + start
+		}
+		// 立即把全量已托管条目落盘（含本卡）。错误致命：kill 刚启动的 ppumem 再报错。
+		allEntries := append(append([]string{}, entries...), pidStart)
+		if werr := writeMarker(uid, strings.Join(allEntries, ",")); werr != nil {
 			_ = killHostPid(ctx, pid, "TERM")
 			_ = waitProcGone(ctx, pid, 2*time.Second)
-			return fmt.Errorf("persist memfill marker after ppu[%s] error: %s (已 kill 该 ppumem 防孤儿; 已托管的其它卡 PID=%s 仍需人工 recover)", id, werr, strings.Join(pids[:len(pids)-1], ","))
+			return fmt.Errorf("persist memfill marker after ppu[%s] error: %s (已 kill 该 ppumem 防孤儿; 已托管的其它卡条目=%s 仍需人工 recover)", id, werr, strings.Join(entries, ","))
 		}
+		entries = allEntries
 		// 给 ppumem 一点时间实际分配；若进程已退出（cudaMalloc 失败），抓错误。
-		// 注：此时 marker 已含该 pid；若判定它已死，下面返回错误前 marker 会保留（recover 会发现
-		// "进程已不在"且安全无副作用）。即便进程没真死、只是分配慢，marker 落盘也无害。
 		time.Sleep(400 * time.Millisecond)
 		aliveOut, _ := runHostShell(ctx, fmt.Sprintf("kill -0 %s 2>/dev/null && echo alive || echo dead", pid))
 		if strings.TrimSpace(aliveOut) == "dead" {
@@ -669,27 +678,24 @@ func recoverMemFill(ctx context.Context, args []string) error {
 			continue
 		}
 		// 身份校验，防 PID 复用误杀。
-		// entry 有 start 指纹时：要求 comm 前缀匹配 AND start time 与记录一致。
-		// entry 退化为纯 pid（无指纹，例如注入后 helper 刚启动那瞬 /proc 读 stat 偶发失败）时：
-		//   不直接拒绝——先**当场重新抓一次** start time。若进程还在且 comm 匹配，用现抓的指纹
-		//   验一下"此刻这个 pid 就是当初那个"，一致就 kill（恢复能力不丢失）。
-		//   只有连重新抓都拿不到 start（确认无法确证身份）时才拒 kill 保留 marker 交人工。
+		// entry 有 start 指纹：要求 comm 前缀匹配 AND start time 与记录一致才 kill。
+		// entry 退化为纯 pid（无指纹，例如注入后 helper 刚启动那一瞬 /proc 读 stat 偶发失败）：
+		//   fail-closed —— 拒凭"现抓的 start time 当历史指纹"来 kill（codex 闭环复验：现抓的
+		//   start 只能证明"两次查询间 PID 没变"，不能证明"此刻这个 pid 就是当初那个"，PID 复用 +
+		//   comm 同前缀会误杀无关进程）。保留 marker 计失败，交人工按 comm/starttime + 实际场景
+		//   处置。recoverability 不丢失（marker 还在，人工可解），且杜绝误杀。
 		if !strings.HasPrefix(comm, "chaosmeta_ppu") {
 			log.GetLogger(ctx).Warnf("skip memfill pid[%s]: comm=%q 不匹配 ppumem 前缀（pid 复用?）marker 保留", pid, comm)
 			failCount++
 			continue
 		}
 		if expectStart == "" {
-			nowStart := procStartTime(ctx, pid)
-			if nowStart == "" {
-				log.GetLogger(ctx).Warnf("skip memfill pid[%s]: marker 无指纹且现抓 start 也取不到，无法确证身份，拒凭短 comm kill，marker 保留交人工", pid)
-				failCount++
-				continue
-			}
-			expectStart = nowStart
+			log.GetLogger(ctx).Warnf("skip memfill pid[%s]: marker 缺启动时间指纹（注入时 /proc 偶发读不到），不凭现抓 start 凭短 comm kill（防 PID 复用误杀）；marker 保留交人工 recover", pid)
+			failCount++
+			continue
 		}
 		if procStartTime(ctx, pid) != expectStart {
-			log.GetLogger(ctx).Warnf("skip memfill pid[%s]: 启动时间不匹配（pid 复用? 现=%s 记录=%s）marker 保留", pid, procStartTime(ctx, pid), expectStart)
+			log.GetLogger(ctx).Warnf("skip memfill pid[%s]: 启动时间不匹配（现=%s 记录=%s，pid 复用?）marker 保留", pid, procStartTime(ctx, pid), expectStart)
 			failCount++
 			continue
 		}
@@ -737,21 +743,6 @@ func procStartTime(ctx context.Context, pid string) string {
 func killHostPid(ctx context.Context, pid, sig string) error {
 	_, err := runHostShell(ctx, fmt.Sprintf("kill -%s %s 2>/dev/null", sig, pid))
 	return err
-}
-
-// pidWithStarts 把纯 pid 列表转成 "pid:starttime" 列表，供 recover 做 PID 身份校验（C2）。
-// 启动时间取不到时退化为纯 pid（recover 会走兼容分支，只校验 comm）。
-func pidWithStarts(ctx context.Context, pids []string) []string {
-	out := make([]string, 0, len(pids))
-	for _, p := range pids {
-		st := procStartTime(ctx, p)
-		if st == "" {
-			out = append(out, p)
-		} else {
-			out = append(out, p+":"+st)
-		}
-	}
-	return out
 }
 
 // ============================ fault: reset (卡复位) ============================
@@ -1227,12 +1218,12 @@ func recoverMemClock(ctx context.Context, args []string) error {
 }
 
 func parseMemClockArgs(ctx context.Context, args []string) (ids []string, uid string, mhz int, err error) {
-	ids, err = resolveTargetIds(ctx, args[0])
-	if err != nil {
-		return
-	}
 	uid = args[1]
 	if err = validateUid(uid); err != nil {
+		return
+	}
+	ids, err = resolveTargetIds(ctx, args[0])
+	if err != nil {
 		return
 	}
 	mhz, err = strconv.Atoi(args[2])
@@ -1487,12 +1478,12 @@ func recoverToggle(ctx context.Context, fault string, args []string) error {
 }
 
 func parseToggleArgs(ctx context.Context, args []string) (ids []string, uid, code string, err error) {
-	ids, err = resolveTargetIds(ctx, args[0])
-	if err != nil {
-		return
-	}
 	uid = args[1]
 	if err = validateUid(uid); err != nil {
+		return
+	}
+	ids, err = resolveTargetIds(ctx, args[0])
+	if err != nil {
 		return
 	}
 	code = args[2]
@@ -1502,12 +1493,12 @@ func parseToggleArgs(ctx context.Context, args []string) (ids []string, uid, cod
 // ============================ args parsers ============================
 
 func parseAppClocksArgs(ctx context.Context, args []string) (ids []string, uid, memStr, cuStr string, err error) {
-	ids, err = resolveTargetIds(ctx, args[0])
-	if err != nil {
-		return
-	}
 	uid = args[1]
 	if err = validateUid(uid); err != nil {
+		return
+	}
+	ids, err = resolveTargetIds(ctx, args[0])
+	if err != nil {
 		return
 	}
 	parts := strings.SplitN(args[2], ",", 2)
@@ -1521,12 +1512,12 @@ func parseAppClocksArgs(ctx context.Context, args []string) (ids []string, uid, 
 }
 
 func parseBurnArgs(ctx context.Context, args []string) (ids []string, uid string, percent int, err error) {
-	ids, err = resolveTargetIds(ctx, args[0])
-	if err != nil {
-		return
-	}
 	uid = args[1]
 	if err = validateUid(uid); err != nil {
+		return
+	}
+	ids, err = resolveTargetIds(ctx, args[0])
+	if err != nil {
 		return
 	}
 	percent, _ = strconv.Atoi(args[2])
@@ -1537,12 +1528,12 @@ func parseBurnArgs(ctx context.Context, args []string) (ids []string, uid string
 }
 
 func parseMemFillArgs(ctx context.Context, args []string) (ids []string, uid string, mb int, err error) {
-	ids, err = resolveTargetIds(ctx, args[0])
-	if err != nil {
-		return
-	}
 	uid = args[1]
 	if err = validateUid(uid); err != nil {
+		return
+	}
+	ids, err = resolveTargetIds(ctx, args[0])
+	if err != nil {
 		return
 	}
 	mb, err = strconv.Atoi(args[2])
@@ -1556,12 +1547,12 @@ func parseMemFillArgs(ctx context.Context, args []string) (ids []string, uid str
 }
 
 func parseClockArgs(ctx context.Context, args []string) (ids []string, uid string, mhz int, err error) {
-	ids, err = resolveTargetIds(ctx, args[0])
-	if err != nil {
-		return
-	}
 	uid = args[1]
 	if err = validateUid(uid); err != nil {
+		return
+	}
+	ids, err = resolveTargetIds(ctx, args[0])
+	if err != nil {
 		return
 	}
 	mhz, err = strconv.Atoi(args[2])
@@ -1569,12 +1560,12 @@ func parseClockArgs(ctx context.Context, args []string) (ids []string, uid strin
 }
 
 func parsePowerArgs(ctx context.Context, args []string) (ids []string, uid string, watts int, err error) {
-	ids, err = resolveTargetIds(ctx, args[0])
-	if err != nil {
-		return
-	}
 	uid = args[1]
 	if err = validateUid(uid); err != nil {
+		return
+	}
+	ids, err = resolveTargetIds(ctx, args[0])
+	if err != nil {
 		return
 	}
 	watts, err = strconv.Atoi(args[2])
@@ -1582,12 +1573,12 @@ func parsePowerArgs(ctx context.Context, args []string) (ids []string, uid strin
 }
 
 func parseComputeModeArgs(ctx context.Context, args []string) (ids []string, uid string, mode string, err error) {
-	ids, err = resolveTargetIds(ctx, args[0])
-	if err != nil {
-		return
-	}
 	uid = args[1]
 	if err = validateUid(uid); err != nil {
+		return
+	}
+	ids, err = resolveTargetIds(ctx, args[0])
+	if err != nil {
 		return
 	}
 	mode = args[2]
