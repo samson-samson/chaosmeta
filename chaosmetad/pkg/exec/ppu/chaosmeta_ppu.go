@@ -590,15 +590,22 @@ func ensurePpumem(ctx context.Context) error {
 
 // injectMemFill args: [targetIds, uid, mb]
 // 每目标卡起一个 ppumem 进程占 mb MB 显存，记录宿主 PID。
-// 标记文件在每张卡 ppumem 启动成功后增量写一次（best-effort），这样即使后续某卡失败、
-// 注入器触发 inline undo(recover)，recover 也能读到已启动的 ppumem PID 把它们 kill 掉，
-// 避免中途失败时已分配的 GPU 显存成为孤儿（修复 codex review C1）。
+//
+// 孤儿防护（codex review Critical C1）：先写一个空 PID 的 marker 把 uid 的占位记下，
+// 再每张卡 ppumem 启动成功后增量把 PID 追写进标记。这样任何时机崩溃/失败，recover 都能
+// 读到 marker 并 kill 已启动的 ppumem，不会让已占的 GPU 显存成孤儿。至关重要：writeMarker
+// 错误不再被忽略——若持久化失败而 ppumem 已启动，立即 kill 该 ppumem 并报错，避免出现
+// "进程在跑但没人能 recover 它"的状态。
 func injectMemFill(ctx context.Context, args []string) error {
 	targetIds, uid, mb, err := parseMemFillArgs(ctx, args)
 	if err != nil {
 		return err
 	}
 	bin := ppumemBinPath()
+	// 先写空 PID 占位 marker，保证"已在跑但还没回 PID"窗口里也能通过 uid 找到记录。
+	if err := writeMarker(uid, ""); err != nil {
+		return fmt.Errorf("pre-write memfill marker for uid[%s] error: %s (拒绝启动 ppumem 以防孤儿)", uid, err)
+	}
 	var pids []string
 	for _, id := range targetIds {
 		// nohup ppumem <id> <mb> &，全 LD_LIBRARY_PATH 保证 libhggcrt1.so 可加载。
@@ -618,8 +625,14 @@ func injectMemFill(ctx context.Context, args []string) error {
 			return fmt.Errorf("ppumem for ppu[%s] exited immediately (cudaMalloc %dMB failed; card may be full or SDK/lib missing). pid=%s", id, mb, pid)
 		}
 		pids = append(pids, pid)
-		// 增量持久化已启动的 PID，保证中途失败时 recover 仍能清理已占用显存的 ppumem。
-		_ = writeMarker(uid, strings.Join(pids, ","))
+		// 增量持久化已启动的 PID（连同启动时间指纹，C2 修复）。错误是致命数据安全隐患：
+		// 进程在占显存但标记没写进去 = 无法 recover → 显存孤儿。立即 kill 这个刚启动的
+		// ppumem 再返回错误。
+		if werr := writeMarker(uid, strings.Join(pidWithStarts(ctx, pids), ",")); werr != nil {
+			_ = killHostPid(ctx, pid, "TERM")
+			_ = waitProcGone(ctx, pid, 2*time.Second)
+			return fmt.Errorf("persist memfill marker after ppu[%s] error: %s (已 kill 该 ppumem 防孤儿; 已启动的其它卡 PID=%s 仍需人工 recover)", id, werr, strings.Join(pids[:len(pids)-1], ","))
+		}
 	}
 	// 标记已在上面的循环里增量持久化（每张卡成功后写一次）。这里无需再写。
 	return nil
@@ -632,27 +645,37 @@ func recoverMemFill(ctx context.Context, args []string) error {
 		return err
 	}
 	var failCount int
-	for _, pid := range strings.Split(idsStr, ",") {
-		pid = strings.TrimSpace(pid)
-		if pid == "" {
+	for _, entry := range strings.Split(idsStr, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
 			continue
+		}
+		// entry 形如 "pid:starttime"（C2 修复：同时存 PID 与该进程启动时间指纹）。
+		// 兼容旧格式纯 pid：无 start 时只按 comm 校验。
+		pid := entry
+		expectStart := ""
+		if i := strings.Index(entry, ":"); i >= 0 {
+			pid = entry[:i]
+			expectStart = entry[i+1:]
 		}
 		// 校验是 ppumem 进程，防 PID 复用误杀。注意 Linux /proc/<pid>/comm 截断到 15
 		// 字符，"chaosmeta_ppumem"(16) 会被截成 "chaosmeta_ppu"——匹配截断前缀即可，
-		// 与 ppu-smi 的 comm("ppu-smi") 不冲突。
-		commOut, _ := runHostShell(ctx, fmt.Sprintf("cat /proc/%s/comm 2>/dev/null", pid))
-		comm := strings.TrimSpace(commOut)
-		if comm != "" && !strings.HasPrefix(comm, "chaosmeta_ppu") {
-			log.GetLogger(ctx).Warnf("skip memfill pid[%s]: comm=%q not ppumem (pid reused?)", pid, comm)
+		// 与 ppu-smi 的 comm("ppu-smi") 不冲突。若存了启动时间，进一步校验 PID 身份。
+		if !matchProcByCommAndStart(ctx, pid, "chaosmeta_ppu", expectStart) {
+			commOut, _ := runHostShell(ctx, fmt.Sprintf("cat /proc/%s/comm 2>/dev/null", pid))
+			comm := strings.TrimSpace(commOut)
+			if comm == "" {
+				// 进程已退出：cudaFree 由 runtime 自动释放显存，视为成功清理。
+				continue
+			}
+			log.GetLogger(ctx).Warnf("skip memfill pid[%s]: comm=%q 相同前缀但 PID 身份不匹配（pid 复用? start=%s）", pid, comm, procStartTime(ctx, pid))
 			failCount++
 			continue
 		}
 		// ppumem 退出时 cudaFree 由 runtime 自动释放显存；kill 不到就计入失败保留标记。
 		if out, err := runHostShell(ctx, fmt.Sprintf("kill -TERM %s 2>/dev/null", pid)); err != nil {
-			if comm != "" {
-				log.GetLogger(ctx).Warnf("kill memfill pid[%s] error: %s; out: %s", pid, err, out)
-				failCount++
-			}
+			log.GetLogger(ctx).Warnf("kill memfill pid[%s] error: %s; out: %s", pid, err, out)
+			failCount++
 			continue
 		}
 		// kill -TERM 成功不等进程真死。ppumem 收到 TERM 要走 cudaFree+cudaDeviceReset 才释放显存，
@@ -679,6 +702,55 @@ func waitProcGone(ctx context.Context, pid string, timeout time.Duration) bool {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return false
+}
+
+// procStartTime 读 /proc/<pid>/stat 第 22 字段（启动时间，clock ticks）作为 PID 身份指纹。
+// PID 复用后 start time 会变，用它校验"现在这个 pid 还是当初记录的那个进程"，防误杀
+// （codex review Critical C2：仅凭 PID+comm 不足以可靠识别，崩后 PID 复用会误杀无关进程）。
+func procStartTime(ctx context.Context, pid string) string {
+	// awk 安全：pid 已在 kill 前用过，这里 pid 来自 marker（我们写的整数），不会含 shell 元字符。
+	out, _ := runHostShell(ctx, fmt.Sprintf("awk '{print $22}' /proc/%s/stat 2>/dev/null", pid))
+	return strings.TrimSpace(out)
+}
+
+// matchProcByCommAndStart 校验 pid 当前 comm 前缀匹配，且（若给了期待 start time）启动时间一致。
+// comm 前缀是容忍 /proc/<pid>/comm 15 字符截断的折中；start time 一致才判"是当初那个进程"。
+func matchProcByCommAndStart(ctx context.Context, pid, commPrefix, expectStart string) bool {
+	commOut, _ := runHostShell(ctx, fmt.Sprintf("cat /proc/%s/comm 2>/dev/null", pid))
+	comm := strings.TrimSpace(commOut)
+	if comm == "" {
+		return false // 进程已不在，谈不上匹配（调用方按"已死"处理）
+	}
+	if !strings.HasPrefix(comm, commPrefix) {
+		return false
+	}
+	if expectStart != "" {
+		if procStartTime(ctx, pid) != expectStart {
+			return false
+		}
+	}
+	return true
+}
+
+// killHostPid 给宿主 pid 发 signal（TERM/KILL）。pid 不含 shell 元字符（来自 marker 整数）。
+func killHostPid(ctx context.Context, pid, sig string) error {
+	_, err := runHostShell(ctx, fmt.Sprintf("kill -%s %s 2>/dev/null", sig, pid))
+	return err
+}
+
+// pidWithStarts 把纯 pid 列表转成 "pid:starttime" 列表，供 recover 做 PID 身份校验（C2）。
+// 启动时间取不到时退化为纯 pid（recover 会走兼容分支，只校验 comm）。
+func pidWithStarts(ctx context.Context, pids []string) []string {
+	out := make([]string, 0, len(pids))
+	for _, p := range pids {
+		st := procStartTime(ctx, p)
+		if st == "" {
+			out = append(out, p)
+		} else {
+			out = append(out, p+":"+st)
+		}
+	}
+	return out
 }
 
 // ============================ fault: reset (卡复位) ============================
@@ -721,12 +793,15 @@ func injectReset(ctx context.Context, args []string) error {
 }
 
 // cardHasComputeApp 检测某卡是否有活跃算力进程（用 --query-compute-apps）。
-// busy=true 时 why 描述障碍（进程名/pid）。
-func cardHasComputeApp(ctx context.Context, id string) (bool, string) {
+// 返回 busy=true 时 why 描述障碍（进程名/pid）。由于 reset 是高危故障，本函数
+// 必须 fail-closed：查询失败/不可判时返回 busy=true 且 fail=true，让调用方拒绝 reset，
+// 而非把"未知是否忙"当成"安全"去 reset（codex review Critical: 原实现查询失败时返回
+// busy=false 即 fail-open，会让 reset 误杀线上推理）。
+func cardHasComputeApp(ctx context.Context, id string) (busy bool, why string) {
 	out, err := runPpu(ctx, ppuCmd("--query-compute-apps=ppu_uuid,used_memory", "--format=csv,noheader", "-i", id))
 	if err != nil {
-		// 查询失败不阻断 reset（保守起见），只 warn。
-		return false, ""
+		// 查询失败视为"该卡忙/状态未知"，拒绝 reset（fail-closed）。
+		return true, fmt.Sprintf("无法确认该卡算力占用状态（--query-compute-apps 失败，不应在不确定时复位），raw=%q", strings.TrimSpace(out))
 	}
 	// -i N 的 compute-apps 输出若有行，说明该卡有算力进程。
 	lines := strings.Split(strings.TrimSpace(out), "\n")
@@ -1284,14 +1359,17 @@ func injectToggle(ctx context.Context, fault string, args []string) error {
 	if d, ok := directionalToggle[fault]; ok {
 		code = d.code
 	}
-	// 抓注入前原值存 marker（recover-to-original）。
+	// 抓注入前原值存 marker（recover-to-original）。原值必须可靠捕获，否则 recover
+	// 无法恢复到位（codex review Critical C4+W：原实现 best-effort 捕获，失败时注入仍继续，
+	// recover 只能伪造 0，永久破坏生产配置）。这里改为 fail-fast：任一卡原值捕获失败则拒绝注入。
 	state := map[string]*markerState{}
 	for _, id := range targetIds {
 		orig, qerr := queryToggleState(ctx, base, id)
 		if qerr != nil {
-			log.GetLogger(ctx).Warnf("capture pre-inject %s state for ppu[%s] (best-effort): %s", base, id, qerr)
-			state[id] = &markerState{ComputeMode: ""}
-			continue
+			return fmt.Errorf("[toggle:%s] 拒绝注入：无法捕获 ppu[%s] 的注入前原值（%s），recover 将无法恢复到位。请在该卡可正常查询 %s 状态后再注入。", base, id, qerr, base)
+		}
+		if strings.TrimSpace(orig) == "" {
+			return fmt.Errorf("[toggle:%s] 拒绝注入：ppu[%s] 的注入前 %s 原值为空，无法安全 recover。", base, id, base)
 		}
 		state[id] = &markerState{ComputeMode: orig}
 	}
@@ -1377,9 +1455,20 @@ func recoverToggle(ctx context.Context, fault string, args []string) error {
 	}
 	var failCount int
 	for _, id := range rec.IDs {
-		origCode := "0"
+		// recover-to-original：必须用注入前抓到的原值恢复，绝不能在原值缺失时伪造 "0"
+		// 去复位（codex review Critical C4：原实现 capture 失败时 recover 默认 "0"，会把
+		// 原本 Overclock=Ultra / ECC=MIG=enabled / VGPU 等生产配置永久改成 0）。原值缺失
+		// 时保留标记并报错，交人工确认，而非用默认值覆盖配置。
+		var origCode string
+		var haveOrig bool
 		if rec.State[id] != nil && rec.State[id].ComputeMode != "" {
 			origCode = toggleTextToCode(base, rec.State[id].ComputeMode)
+			haveOrig = true
+		}
+		if !haveOrig {
+			log.GetLogger(ctx).Warnf("recover %s for ppu[%s]: 注入前原值未捕获，拒绝用默认 0 覆盖（避免破坏生产配置）；标记保留交人工", fault, id)
+			failCount++
+			continue
 		}
 		cmd := ppuCmd(fmt.Sprintf("%s %s -i %s", spec.flag, origCode, id))
 		if out, err := runPpu(ctx, cmd); err != nil {
@@ -1490,7 +1579,20 @@ func parseComputeModeArgs(ctx context.Context, args []string) (ids []string, uid
 // 旧格式（纯 "0,1" 逗号列表）仍兼容：readMarkerIdList 解析旧格式。
 
 func markerPath(uid string) string {
-	return fmt.Sprintf("%s/chaosmeta_ppu_%s.marker", os.TempDir(), uid)
+	return fmt.Sprintf("%s/chaosmeta_ppu_%s.marker", os.TempDir(), safeUid(uid))
+}
+
+// safeUid 对 uid 做严格白名单校验后返回（失败时返回占位 "invalid"）。
+// 目的（codex review Critical C5 深度防御）：uid 一路被拼进 shell 命令（runHostShell 的 fmt.Sprintf）
+// 和 marker 文件名。虽然 chaosmetad 上游通常以 UUID 形式生成 uid，但在本内核工具边界处显式校验，
+// 可杜绝 uid 含 '; / .. ' 等元字符导致的宿主机命令注入或 marker 路径穿越（如覆盖 /tmp 下其它文件）。
+var uidRe = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,128}$`)
+
+func safeUid(uid string) string {
+	if uidRe.MatchString(uid) {
+		return uid
+	}
+	return "invalid"
 }
 
 func writeMarker(uid, ids string) error {
