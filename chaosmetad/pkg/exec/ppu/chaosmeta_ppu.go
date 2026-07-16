@@ -146,6 +146,15 @@ func resolveToggleFault(fault string) (string, bool) {
 
 // [func] [fault] [level] [args]
 func main() {
+	// 参数数守护卫（codex review Minor #1）：[func][fault][level] 至少 3 个位置参数，否则
+	// os.Args[1..3] 直接索引会 panic（slice bounds out of range）。这里返回受控的非零退出 +
+	// 用法提示，避免特权宿主工具抛栈给调度方（如 job/daemon 直接 exec 时 PPU_ARGS 为空/残缺）。
+	if len(os.Args) < 4 {
+		errutil.ExitExpectedErr(fmt.Sprintf(
+			"chaosmeta_ppu: missing arguments. usage: %s <func:validator|inject|recover> <fault> <level> [args...]. got %d arg(s): %v",
+			os.Args[0], len(os.Args), os.Args[1:],
+		))
+	}
 	var (
 		err                       error
 		fName, fault, level, args = os.Args[1], os.Args[2], os.Args[3], os.Args[4:]
@@ -172,6 +181,16 @@ func main() {
 // ============================ dispatch ============================
 
 func execValidator(ctx context.Context, fault string, args []string) error {
+	// 参数数守卫（codex review Minor #1）：validator 内会 args[0] 取 targetIds、部分 validator
+	// 取 args[1] 取值(value/code)，不足会 panic。reset 仅需 targetIds(1)；其余 validator 需
+	// targetIds+value(≥2)。下界先拦，各 validator 仍做语义校验返回 error。
+	minArgs := 2
+	if fault == FaultPPUReset {
+		minArgs = 1
+	}
+	if len(args) < minArgs {
+		return fmt.Errorf("validator %s: insufficient arguments (need %d, got %d)", fault, minArgs, len(args))
+	}
 	switch fault {
 	case FaultPPUBurn:
 		return validatorBurn(ctx, args)
@@ -199,6 +218,16 @@ func execValidator(ctx context.Context, fault string, args []string) error {
 }
 
 func execInject(ctx context.Context, fault string, args []string) error {
+	// 参数数守卫（codex review Minor #1）：handler/parser 内会 args[0..2] 取值，args 不足会
+	// panic（slice bounds out of range）。reset 仅需 [targetIds]（1 个），其余 inject 需
+	// [targetIds,uid,value...]（≥3）。下界先在这里拦，各 handler 仍做语义校验返回 error。
+	minArgs := 3 // 绝大多数 inject: targetIds, uid, value
+	if fault == FaultPPUReset {
+		minArgs = 1 // reset: 仅 targetIds
+	}
+	if len(args) < minArgs {
+		return fmt.Errorf("inject %s: insufficient arguments (need %d, got %d); usage: <targetIds> <uid> <value...> (reset: <targetIds>)", fault, minArgs, len(args))
+	}
 	switch fault {
 	case FaultPPUBurn:
 		return injectBurn(ctx, args)
@@ -226,6 +255,11 @@ func execInject(ctx context.Context, fault string, args []string) error {
 }
 
 func execRecover(ctx context.Context, fault string, args []string) error {
+	// 参数数守卫（codex review Minor #1）：recover handler 取 args[0]=uid，args 不足会 panic。
+	// reset 无需 recover（直接返回 nil）。其余 recover 至少需 [uid]（1 个）。
+	if fault != FaultPPUReset && len(args) < 1 {
+		return fmt.Errorf("recover %s: missing arguments; need <uid> (see chaosmetad fault spec)", fault)
+	}
 	switch fault {
 	case FaultPPUBurn:
 		return recoverBurn(ctx, args)
