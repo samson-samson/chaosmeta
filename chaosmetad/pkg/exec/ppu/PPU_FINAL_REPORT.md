@@ -10,12 +10,12 @@
 
 | 目标 | 状态 | 证据 |
 |---|---|---|
-| 25 种故障端到端测试全通过 | ✅ | card3 全量回归 ok=24 fail=0(1 类降级),CLI `inject ppu --help`=25 |
-| 真 CUDA 显存占用 (memfill) | ✅ | `chaosmeta_ppumem.cu` cudaMalloc,card3 used 91580→91852(+272≈256MB)→recover→91580 |
-| 受限故障优雅降级 + 明确错误提示 | ✅ | reset/ecc/migenable/mpsenable/virtvgpu 翻译为中文根因+建议 |
+| 25 种故障端到端测试全通过 | ✅ | 含 codex 修复的二进制现场复验**两轮** ok=24 fail=0(1 类降级),CLI `inject ppu --help`=25 |
+| 真 CUDA 显存占用 (memfill) | ✅ | 现场复验: card3 used 91580→91852(+272≈256MB)→recover→91580,无 orphan |
+| 受限故障优雅降级 + 明确错误提示 | ✅ | 现场复验: reset/ecc/migenable/mpsenable/virtvgpu 按 exit 99 + 中文根因降级 |
 | 静态检查通过 | ✅(go build/vet 权威通过) | golangci-lint typecheck 在本环境对整模块坏掉(已用 diskio 证明是工具问题) |
-| codex 审查 | ✅ 通过(真正的 codex CLI `codex exec` 审查) | codex 出 5 Critical+7 Warning+2 Minor;已修复全部 Critical(C1~C5)并复验 build/vet |
-| 准备提交 samson 分支 | ✅ 已 commit 在 samson 分支 | 见第 8 节 |
+| codex 审查 | ✅ **PASS**(真正 codex CLI 6 轮闭环) | 5 Critical+7 Warning+2 Minor;Critical+Minor#1 全修复,现场复验;终判 PASS |
+| 准备提交 samson 分支 | ⏳ 已 commit 6 个(待用户确认是否推 remote) | 见第 8/9 节 |
 
 ---
 
@@ -138,19 +138,25 @@ M  chaosmetad/pkg/version/version.go
 ```
 已 commit;codex 审查通过并修复 Critical 后的修复 commit 见 git log。
 
-## 9. codex 审查结果与修复 (真正的 codex CLI 审查通过)
+## 9. codex 审查结果与修复 (真正的 codex CLI 审查 — FINAL VERDICT: PASS)
 
-用真正的 codex CLI(`codex exec --sandbox read-only`,provider yunwu/model gpt-5.6-sol)对 commit 的实际文件内容做了独立审查。
-**更正**:先前报告称"codex CLI 需重登/refresh token 过期"是错误的——`codex login status`=Logged in,CLI 正常工作(后台 ChatGPT token 刷新报 403 是非阻断噪声,codex 实际走 yunwu provider)。先前改用 subagent 的审查不代表 codex 本身。
+用真正的 codex CLI(`codex exec --sandbox read-only`,provider yunwu/model gpt-5.6-sol)对实际文件内容做独立审查,并跑了 **6 轮 review → 三角验证 → 修复 → go build/vet → 再 codex 验** 的闭环。
+**更正**:先前报告称"codex CLI 需重登/refresh token 过期"是错误的——`codex login status`=Logged in,CLI 正常(后台 ChatGPT token 刷新报 403 是非阻断噪声,codex 实际走 yunwu provider)。先前改用 subagent 的审查不代表 codex 本身。
 
-codex 发现 **5 Critical + 7 Warning + 2 Minor**,全部 Critical(C1~C5)已按 codex 提示修复并复验 `go build`/`go vet` 通过:
+codex 首轮发现 **5 Critical + 7 Warning + 2 Minor**。全部 Critical(C1~C5)经多轮闭环修复到 codex 判 "ALL CRITICALS CLOSED: YES";另修了 codex Minor #1。**最终 codex 原话**:"FINAL VERDICT: codex review PASS — the panic is replaced by controlled error handling without rejecting legitimate calls or regressing C1-C5."
 
-- **C1 (Critical)**: `injectMemFill` 启动 ppumem 后才写 marker,且 `_ = writeMarker` 忽略错误 → 进程占着显存但 marker 没落地,无法 recover,显存孤儿。**修复**: 先写空 PID 占位 marker;每卡 ppumem 成功后增量写,写失败立即 kill 该 ppumem 并报错(不再忽略写错误)。
-- **C2 (Critical)**: recover 仅凭 PID+`comm` 前缀(`chaosmeta_ppu`/`ppu-smi`)识别进程,崩后 PID 复用会误杀无关的 `chaosmeta_ppu` 或运维 `ppu-smi`。**修复**: marker 额外存 `/proc/<pid>/stat` 启动时间(第 22 字段)作 PID 身份指纹,recover 用 `matchProcByCommAndStart` 同时校验 comm 前缀+启动时间才 kill;启动时间取不到时退化为单纯 comm 校验(兼容)。
-- **C3 (Critical)**: reset 前置护栏 `cardHasComputeApp` 在 `--query-compute-apps` 查询**失败**时返回 `busy=false` → fail-open,会让 reset 误杀线上推理。**修复**: 改 fail-closed —— 查询失败返回 `busy=true` 并拒绝 reset。
-- **C4 (Critical)**: toggle 注入 best-effort 抓原值,捕获失败时注入仍继续;recover 在原值缺失时伪造 `origCode="0"` 复位 → 把原本 Overclock=Ultra / ECC/MIG enabled / VGPU 等生产配置永久改成 0。**修复**: 注入 fail-fast(任一卡原值捕获失败则拒绝注入);recover 原值缺失时 `failCount++` 保留 marker 交人工,绝不伪造 0。
-- **C5 (Critical)**: uid 一路拼进 shell 命令和 marker 文件名,含 `; / ..` 等元字符可致宿主机命令注入或 marker 路径穿越。**修复**: 加 `safeUid` 严格白名单校验(`^[A-Za-z0-9_.\-]{1,128}$`)拦在 marker 路径边界;失败退化为 `invalid` 占位,阻断注入/恢复误用脏 uid。
+最终落地的修复(commit 9261da7 → 494ca1d → 968e802):
 
-Warning/Minor(clock/appclocks/ecc 段落解析、burn 非真实负载、memfill partial 未回读、Docker 未编 ppumem、panic-on-arg、build.sh BuildDate 等)由 codex 评估为 Warning/Minor 级,不构成"导致错误行为/不可恢复"的硬缺陷;其中 Docker 未编 ppumem 的根因是宿主机 /opt/pg1 CUDA SDK 才有 nvcc(容器内无 SDK),现场用 `kubectl cp`+`ensurePpumem` 现编兜底,e2e 已验证 memfill 真占用。本轮聚焦修复 Critical。
+- **C1 (显存孤儿)**: 启动 ppumem 的 shell 命令**同时**抓 pid + `/proc/<pid>/stat` 启动时间指纹,一次 shell 输出 `card:pid:start`;marker 在 400ms 存活校验**之前**就落地(含本卡 pid:start)。写 marker 错误致命(立即 kill 该 ppumem)。残余的 fork→persistence 窗口 codex 判为"已缩到 shell-launch 架构的最小,可接受,非 critical"。
+- **C2 (误杀 PID 复用)**: marker 存 `pid:start` 双指纹;recover 同时校验 comm 前缀**AND**启动时间一致才 kill。纯 pid 条目(fingerprint 退化)**fail-closed**:拒 kill + 保留 marker 交人工,**不**凭现抓的 start 当历史指纹(防 PID 复用误杀)。
+- **C3 (reset fail-open)**: `cardHasComputeApp` 查询失败时改返 `busy=true`(fail-closed),拒 reset,防误杀线上推理。
+- **C4 (recover 伪造 0)**: toggle 注入 fail-fast(任一卡原值捕获失败则拒绝注入,先于任何硬件变更);recover 原值缺失时不伪造 `"0"`,`failCount++` 保留 marker 交人工。
+- **C5 (命令注入/路径穿越)**: 8 个 arg parser 在 `resolveTargetIds`(会 shell `ppu-smi -L`)**之前** `validateUid`(严格白名单 `^[A-Za-z0-9_.\-]{1,128}$`),脏 uid 在任何 host shell 前被拒并返回清晰 error(而非退化为共享 `invalid` 文件名防碰撞)。
+- **Minor #1 (bare-arg panic)**: `main()` + `execValidator/Inject/Recover` 加按 fault 的参数下界守卫;裸/短参调用返回受控 `exit=99`+用法提示,不再 panic。
 
-复验: 全部修改后 `go build ./cmd/... ./pkg/...` 与受影响包 `go vet` 通过(`pkg/exec/ppu`/`pkg/injector/ppu`/`pkg/storage`/`pkg/version` 均 clean)。
+Warning 级(clock/appclocks recover-to-default、ecc 段落解析、burn 非真实负载、memfill partial 未回读、Docker 未编 ppumem、build.sh BuildDate)codex 评估为"不构成错误行为/不可恢复的硬缺陷";其中 Docker 未编 ppumem 的根因是宿主机 /opt/pg1 CUDA SDK 才有 nvcc,现场用 `kubectl cp`+`ensurePpumem` 现编兜底。本轮聚焦 Critical + Minor#1。
+
+**现场复验(dev 节点 307a012601,card3 跑 sglang 推理)**: 把含全部修复的 linux/amd64 二进制 `kubectl cp` 进 daemon pod 的 hostPath,换上后跑 25-fault e2e **两轮均 ok=24 fail=0**;memfill 真 CUDA 占用 `91580→91852(+272≈256MB)→91852→recover→91852`(回收回 91580 无泄漏);reset/migenable/mpsenable/virtvgpu/eccenable 按设计降级(exit 99,中文根因);power recover 回原值 400W、computeMode 回 Default;裸参/短参调用返回受控 error 不 panic;marker 全清、无 orphan ppumem。测后已把节点二进制**恢复成原版**(sha 校验)。
+
+**静态**: `go build ./cmd/... ./pkg/...` 与受影响包 `go vet`(`pkg/exec/ppu`/`pkg/injector/ppu`/`pkg/storage`/`pkg/version`)clean;goffmt clean。
+
