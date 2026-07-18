@@ -60,16 +60,21 @@ type PhaseType string
 const (
 	InjectPhaseType  PhaseType = "inject"
 	RecoverPhaseType PhaseType = "recover"
+	PausePhaseType   PhaseType = "pause" // NEW: transient phase used only to drive a pause action (process-type faults)
 )
 
 type StatusType string
 
 const (
 	CreatedStatusType     StatusType = "created"
-	SuccessStatusType     StatusType = "success"
-	FailedStatusType      StatusType = "failed"
 	RunningStatusType     StatusType = "running"
+	PausedStatusType      StatusType = "paused"     // NEW: user-paused
+	StoppedStatusType     StatusType = "stopped"    // NEW: user-stopped, cleaned
+	RecoveringStatusType  StatusType = "recovering" // NEW: transient, recover in progress
+	SuccessStatusType     StatusType = "success"
 	PartSuccessStatusType StatusType = "partSuccess"
+	FailedStatusType      StatusType = "failed"
+	ErrorStatusType       StatusType = "error" // NEW: abnormal, fault may still be resident; explicit stop can still recover it
 )
 
 // ExperimentStatus defines the observed state of Experiment

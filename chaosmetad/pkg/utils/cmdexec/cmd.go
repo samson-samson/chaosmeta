@@ -126,6 +126,32 @@ func StartSleepRecover(ctx context.Context, sleepTime int64, uid string) error {
 	return StartBashCmd(ctx, utils.GetSleepRecoverCmd(sleepTime, uid))
 }
 
+// StartSleepRecoverWithPid forks a detached `sleep N; chaosmetad recover <uid>` process
+// and returns its PID plus the scheduled fire deadline (unix seconds).
+// The process is fully detached (new session) so it survives chaosmetad restart and does
+// not receive signals from the daemon. The daemon never waits on it.
+// Returns utils.NoPid on error. Deadline is time.Now()+sleepTime even on partial failure.
+func StartSleepRecoverWithPid(ctx context.Context, sleepTime int64, uid string) (int, int64, error) {
+	log.GetLogger(ctx).Debugf("start sleep-recover cmd with pid for uid[%s], sleep[%d]s", uid, sleepTime)
+	cmd := exec.Command("/bin/bash", "-c", utils.GetSleepRecoverCmd(sleepTime, uid))
+	// Fully detach: new session so it survives daemon restart and won't get SIGINT from daemon's process group.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// Discard I/O so the orphan does not hold a pipe fd open against the daemon.
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+	if err := cmd.Start(); err != nil {
+		return utils.NoPid, 0, fmt.Errorf("cmd start error: %s", err.Error())
+	}
+	pid := cmd.Process.Pid
+	// Release so the kernel does not keep the daemon as parent reaper; the orphan re-parents to init.
+	if cmd.Process != nil {
+		_ = cmd.Process.Release()
+	}
+	deadline := time.Now().Unix() + sleepTime
+	return pid, deadline, nil
+}
+
 func waitProExec(ctx context.Context, stdout, stderr *bytes.Buffer, timeoutSec int) (err error) {
 	var msg, timer = "", time.NewTimer(InjectCheckInterval)
 	var startTime = time.Now()
@@ -176,9 +202,20 @@ func RunBashCmdWithOutput(ctx context.Context, cmd string) (string, error) {
 
 	reByte, err := c.CombinedOutput()
 	re := string(reByte)
-	errMsg := fmt.Sprintf("exit code: %d, output: %s, error: %v", c.ProcessState.Sys().(syscall.WaitStatus).ExitStatus(), re, err)
+	// Defensive: c.ProcessState is nil when the process failed to start (e.g. /bin/bash missing,
+	// or exec error before fork). Dereferencing .Sys() then panics — and since this helper is
+	// called from the SIGCHLD signal handler (watchSignal -> WaitDefunctProcess), that panic takes
+	// the whole daemon down on a single child-reap, which breaks 7x24h stability. Fall back to a
+	// safe message and let the caller treat it as a normal error.
+	exitCode := -1
+	if c.ProcessState != nil {
+		if ws, ok := c.ProcessState.Sys().(syscall.WaitStatus); ok {
+			exitCode = ws.ExitStatus()
+		}
+	}
+	errMsg := fmt.Sprintf("exit code: %d, output: %s, error: %v", exitCode, re, err)
 	log.GetLogger(ctx).Debugf("exec result: %s", errMsg)
-	if err != nil || c.ProcessState.Sys().(syscall.WaitStatus).ExitStatus() != 0 {
+	if err != nil || exitCode != 0 {
 		//if c.ProcessState.Sys().(syscall.WaitStatus).ExitStatus() == errutil.ExpectedErr {
 		//	return "", fmt.Errorf("output: %s, error: %s", re, err.Error())
 		//}

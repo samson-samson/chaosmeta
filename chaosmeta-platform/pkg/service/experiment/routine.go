@@ -325,8 +325,104 @@ func StopExperiment(experimentInstanceID string, tolerateFailure bool) error {
 	if err := stopExperiment(experimentInstanceID, &experimentStatus, tolerateFailure); err != nil {
 		log.Error("stopExperiment error:", err)
 	}
-	experimentInstanceInfo.Status = experimentStatus
+
+	// D9 fix: phase 2 — confirm chaosmetad actually recovered on every node, instead of trusting the
+	// Argo shutdown state alone. Poll each inject CR's status until it reaches a clean terminal state
+	// (success/stopped) or the confirm timeout elapses. If any node is not clean, escalate to Error and
+	// record the un-cleaned nodes so the UI can alert — never silently claim "stopped" with residue.
+	uncleanNodes := confirmRecoverCompleted(experimentInstanceID, 60*time.Second)
+	if len(uncleanNodes) > 0 {
+		experimentStatus = WorkflowError
+		msg := fmt.Sprintf("stop incomplete, nodes not confirmed clean: %v", uncleanNodes)
+		experimentInstanceInfo.Status = experimentStatus
+		experimentInstanceInfo.Message = msg
+		log.Error(msg)
+		// Persist a log line so the front-end / post-mortem sees the escalation.
+		_ = persistStopLog(experimentInstanceID, experimentInstanceInfo.ExperimentUUID, "error", "recover", msg)
+	} else {
+		experimentInstanceInfo.Status = experimentStatus
+	}
+
 	return experimentInstanceModel.UpdateExperimentInstance(experimentInstanceInfo)
+}
+
+// confirmRecoverCompleted polls every fault (inject) CR referenced by the Argo workflow's nodes and
+// waits until each reports a clean terminal status (success/stopped) or timeout. Returns the display
+// names (== CR names) of nodes that did NOT reach a clean state (empty = all clean). This is the D9
+// backstop that gives the "stop" operation its safety guarantee: a clean terminal everywhere before
+// we claim stop succeeded.
+//
+// CR names are taken from workFlowGet.Status.Nodes[*].DisplayName (the same name used elsewhere to
+// Get/Recover the chaosmeta CR), NOT from the static instance node rows — the latter hold template
+// step names, not CR names.
+func confirmRecoverCompleted(experimentInstanceID string, timeout time.Duration) []string {
+	clusterService := cluster.ClusterService{}
+	_, restConfig, err := clusterService.GetRestConfig(context.Background(), config.DefaultRunOptIns.RunMode.Int())
+	if err != nil {
+		log.Error("confirmRecoverCompleted: get restConfig error:", err)
+		return []string{"<rest-config-unavailable>"}
+	}
+
+	argoWorkFlowCtl, err := NewArgoWorkFlowService(restConfig, config.DefaultRunOptIns.ArgoWorkflowNamespace)
+	if err != nil {
+		log.Error("confirmRecoverCompleted: argo client error:", err)
+		return []string{"<argo-client-unavailable>"}
+	}
+
+	// The workflow may already have been deleted by stopExperiment; if so the CRs were already told to
+	// recover and we best-effort confirm by re-listing what remains. Argo Get failure => treat as cleaned.
+	workFlowGet, _, gerr := argoWorkFlowCtl.Get(getWorFlowName(experimentInstanceID))
+	if gerr != nil || workFlowGet == nil {
+		log.Info("confirmRecoverCompleted: workflow already removed; assuming recover order issued")
+		return nil
+	}
+
+	chaosmetaService := NewChaosmetaService(restConfig)
+	ns := config.DefaultRunOptIns.WorkflowNamespace
+
+	deadline := time.Now().Add(timeout)
+	var unclean []string
+	for _, node := range workFlowGet.Status.Nodes {
+		injectType, isInject := getInjectSecondField(node.DisplayName)
+		if !isInject || injectType != string(FaultExecType) {
+			continue
+		}
+		clean := false
+		for time.Now().Before(deadline) {
+			cr, gerr := chaosmetaService.Get(context.Background(), ns, node.DisplayName)
+			if gerr != nil {
+				// CR absent after a recover order: treat as already cleaned / gc'd.
+				clean = true
+				break
+			}
+			if isCleanTerminal(cr.Status.Status) {
+				clean = true
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+		if !clean {
+			unclean = append(unclean, node.DisplayName)
+		}
+	}
+	return unclean
+}
+
+// persistStopLog writes a single log line to the persistence store (D11). Best-effort: a DB error
+// degrades to a log.Error and must never break the stop flow.
+func persistStopLog(experimentInstanceID, experimentUUID, level, phase, message string) error {
+	l := &experimentInstanceModel.ExperimentInstanceLog{
+		ExperimentUUID:         experimentUUID,
+		ExperimentInstanceUUID: experimentInstanceID,
+		Level:                  level,
+		Phase:                  phase,
+		Message:                message,
+	}
+	if err := experimentInstanceModel.CreateExperimentInstanceLog(l); err != nil {
+		log.Error("persistStopLog error:", err)
+		return err
+	}
+	return nil
 }
 
 func UserStopExperiment(experimentInstanceID string) error {

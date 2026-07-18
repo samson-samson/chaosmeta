@@ -32,7 +32,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sort"
+	"strconv"
 	"time"
+
+	"github.com/go-logr/logr"
 )
 
 // ExperimentReconciler reconciles a Experiment object
@@ -80,24 +83,29 @@ func (r *ExperimentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	logger.Info(fmt.Sprintf("experiment: %s/%s, get status: %s", instance.Namespace, instance.Name, string(status)))
 
 	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
-		if instance.Status.Status == v1alpha1.SuccessStatusType || instance.Status.Status == v1alpha1.FailedStatusType || instance.Status.Status == v1alpha1.PartSuccessStatusType {
-			if instance.Spec.TargetPhase == v1alpha1.InjectPhaseType && instance.Status.Phase == v1alpha1.InjectPhaseType {
-				instance.Spec.TargetPhase = v1alpha1.RecoverPhaseType
-				logger.Info(fmt.Sprintf("update TargetPhase of %s/%s to: %s", instance.Namespace, instance.Name, instance.Spec.TargetPhase))
-				return ctrl.Result{}, r.Update(ctx, instance)
-			} else if instance.Status.Phase == v1alpha1.RecoverPhaseType {
-				solveFinalizer(instance)
-				logger.Info(fmt.Sprintf("update Finalizer of %s/%s to: %s", instance.Namespace, instance.Name, instance.ObjectMeta.Finalizers))
-				return ctrl.Result{}, r.Update(ctx, instance)
-			}
+		// D3/D4 deletion path. solveDeletion returns:
+		//   - done=true  : the deletion reconcile is fully handled this loop (finalizer dropped, or spec
+		//                  updated and must be re-queued / persisted before statusProcess can run).
+		//                  Caller returns the result unchanged.
+		//   - done=false : node-side recover still needs to be driven. Caller MUST fall through to
+		//                  statusProcess below — that is the ONLY path that calls the recover phase
+		//                  handler (ExecuteRecover) on the node. Returning here would sever that path
+		//                  and leave the resident fault on the node forever (the §2.A regression).
+		done, res, err := r.solveDeletion(ctx, instance, logger)
+		if done {
+			return res, err
 		}
-	} else {
-		if instance.Status.Phase == v1alpha1.RecoverPhaseType && (instance.Status.Status == v1alpha1.SuccessStatusType ||
-			instance.Status.Status == v1alpha1.FailedStatusType || instance.Status.Status == v1alpha1.PartSuccessStatusType) {
-			solveFinalizer(instance)
-			logger.Info(fmt.Sprintf("update Finalizer of %s/%s to: %s", instance.Namespace, instance.Name, instance.ObjectMeta.Finalizers))
-			return ctrl.Result{}, r.Update(ctx, instance)
-		}
+		// Else: fall through to statusProcess so the real node recover is driven.
+	}
+
+	// Non-deletion path: if recover has reached a terminal *clean* state, the experiment is done
+	// and we can drop the finalizer. A recover that failed (FailedStatusType / ErrorStatusType) is
+	// NOT a clean state — keep the finalizer so the CR stays around for retry / manual recovery (D4).
+	if instance.Status.Phase == v1alpha1.RecoverPhaseType && (instance.Status.Status == v1alpha1.SuccessStatusType ||
+		instance.Status.Status == v1alpha1.StoppedStatusType) {
+		solveFinalizer(instance)
+		logger.Info(fmt.Sprintf("recover reached clean terminal state; update Finalizer of %s/%s to: %s", instance.Namespace, instance.Name, instance.ObjectMeta.Finalizers))
+		return ctrl.Result{}, r.Update(ctx, instance)
 	}
 
 	if instance.Status.Phase == "" {
@@ -239,4 +247,94 @@ func solveFinalizer(instance *v1alpha1.Experiment) {
 			return
 		}
 	}
+}
+
+// MaxRecoverRetry bounds how many times recover is retried on a deleting CR before we escalate
+// to Error and stop requeuing (protects the apiserver from infinite reconcile storms on a node
+// that is permanently unreachable). On hitting this, the CR is left with its finalizer so it is
+// NOT garbage-collected — a human must recover it manually. See design §2.2.5.
+const MaxRecoverRetry = 8
+
+// recoverRetryKey is an annotation recording how many recover attempts a deleting CR has endured.
+const recoverRetryKey = "chaosmeta.io/recover-retry"
+
+// solveDeletion implements D3 + D4 on the deletion path.
+//
+// D3: deletion must trigger recover from ANY non-clean state — not only success/failed/partSuccess.
+//
+//	A CR deleted while Running/Created/Paused/Recovering/Error previously leaked the resident
+//	fault on the node because the old code never asked the operator to recover for those states.
+//
+// D4: the finalizer is removed ONLY when recover has actually reached a clean terminal state
+//
+//	(Success / Stopped).
+//
+// Return contract (critical — see the §2.A regression):
+//   - done=true  => deletion handled this loop (finalizer dropped; or TargetPhase rewritten and the
+//     spec update must persist + requeue before statusProcess runs against the new spec). Caller
+//     returns immediately.
+//   - done=false => node-side recover still needs driving. Caller MUST fall through to statusProcess,
+//     which is the ONLY place that invokes RecoverPhaseHandler → ExecuteRecover on the node. The
+//     earlier `return r.solveDeletion(...)` form severed this path: the CR requeued into solveDeletion
+//     forever, the retry counter climbed to MaxRecoverRetry, the CR was marked Error, and the node
+//     never received a single recover request.
+func (r *ExperimentReconciler) solveDeletion(ctx context.Context, instance *v1alpha1.Experiment, logger logr.Logger) (bool, ctrl.Result, error) {
+	// A fault may be resident while in any of these states. "Clean" (no resident fault) = Success /
+	// Stopped (SuccessStatusType here means "inject+recover fully succeeded and cleaned").
+	cleanTerminal := instance.Status.Status == v1alpha1.SuccessStatusType ||
+		instance.Status.Status == v1alpha1.StoppedStatusType
+
+	// Already clean and on the recover phase: safe to drop finalizer and let GC reclaim the CR.
+	if cleanTerminal && instance.Status.Phase == v1alpha1.RecoverPhaseType {
+		solveFinalizer(instance)
+		logger.Info(fmt.Sprintf("deletion: clean terminal state reached; remove finalizer of %s/%s", instance.Namespace, instance.Name))
+		return true, ctrl.Result{}, r.Update(ctx, instance)
+	}
+
+	// Need recover. If not already pointed at the recover phase, switch TargetPhase and requeue so
+	// the NEXT reconcile sees TargetPhase=Recover. We deliberately do NOT rewrite Status.Phase here:
+	// when Phase is still Inject (the common "deleting a resident experiment" case), falling through
+	// to statusProcess runs InjectPhaseHandler.SolveSuccess → solveFinalStatus, which reads the new
+	// TargetPhase=Recover, flips Phase to Recover, and builds the recover detail — exactly the normal
+	// recover pipeline. That is the mechanism by which ExecuteRecover actually reaches the node.
+	//
+	// We persist this TargetPhase rewrite and return done=true with Requeue so the spec write lands
+	// before statusProcess mutates Status (mixing r.Update and r.Status().Update in one reconcile
+	// risks a conflict; the original code likewise split this into two reconciles).
+	if instance.Spec.TargetPhase != v1alpha1.RecoverPhaseType {
+		instance.Spec.TargetPhase = v1alpha1.RecoverPhaseType
+		logger.Info(fmt.Sprintf("deletion: not clean (%s), point %s/%s at recover phase", instance.Status.Status, instance.Namespace, instance.Name))
+		return true, ctrl.Result{Requeue: true}, r.Update(ctx, instance)
+	}
+
+	// Already targeting recover but not yet clean. Fall through to statusProcess (done=false) so the
+	// recover phase handler actually executes recover against the node this loop. This is the core
+	// §2.A fix: the earlier code returned here forever, the retry counter climbed to MaxRecoverRetry,
+	// the CR was marked Error, and the node never received a single recover request.
+	//
+	// We return done=false with NO spec/status mutation here: the TargetPhase=Recover rewrite was
+	// already persisted in the branch above on a previous reconcile, and the recover-retry counter
+	// is bumped in-memory only (it rides along on the next spec write or on the Status().Update the
+	// caller performs after statusProcess — both persist it). The caller falls through to statusProcess,
+	// which drives the real node recover, then persists Status via Status().Update.
+	logger.Info(fmt.Sprintf("deletion: %s/%s targeting recover but not clean (%s) — fall through to statusProcess to drive node recover",
+		instance.Namespace, instance.Name, instance.Status.Status))
+	return false, ctrl.Result{}, nil
+}
+
+// incrementRecoverRetry reads & bumps the retry annotation, returning the new count.
+func incrementRecoverRetry(instance *v1alpha1.Experiment) int {
+	v := instance.ObjectMeta.Annotations[recoverRetryKey]
+	n := 0
+	if v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			n = parsed
+		}
+	}
+	n++
+	if instance.ObjectMeta.Annotations == nil {
+		instance.ObjectMeta.Annotations = map[string]string{}
+	}
+	instance.ObjectMeta.Annotations[recoverRetryKey] = strconv.Itoa(n)
+	return n
 }

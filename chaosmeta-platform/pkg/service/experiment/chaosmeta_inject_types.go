@@ -65,11 +65,21 @@ type StatusType string
 
 const (
 	CreatedStatusType     StatusType = "created"
-	SuccessStatusType     StatusType = "success"
-	FailedStatusType      StatusType = "failed"
 	RunningStatusType     StatusType = "running"
+	PausedStatusType      StatusType = "paused"
+	StoppedStatusType     StatusType = "stopped"
+	RecoveringStatusType  StatusType = "recovering"
+	SuccessStatusType     StatusType = "success"
 	PartSuccessStatusType StatusType = "partSuccess"
+	FailedStatusType      StatusType = "failed"
+	ErrorStatusType       StatusType = "error"
 )
+
+// isCleanTerminal reports a status at which the fault is fully recovered and no residue remains.
+// Used by the two-phase stop confirmation (D9): only these mean chaosmetad truly cleaned up.
+func isCleanTerminal(s StatusType) bool {
+	return s == SuccessStatusType || s == StoppedStatusType
+}
 
 // ExperimentStatus defines the observed state of Experiment
 type ExperimentStatus struct {

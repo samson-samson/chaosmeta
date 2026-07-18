@@ -27,6 +27,7 @@ import (
 	"github.com/traas-stack/chaosmeta/chaosmeta-inject-operator/pkg/model"
 	"github.com/traas-stack/chaosmeta/chaosmeta-inject-operator/pkg/scopehandler"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"strconv"
 	"testing"
 )
 
@@ -199,4 +200,46 @@ func Test_solveFinalizer(t *testing.T) {
 	instance.ObjectMeta.Finalizers = []string{v1alpha1.FinalizerName}
 	solveFinalizer(instance)
 	assert.Equal(t, []string{}, instance.ObjectMeta.Finalizers)
+}
+
+// Test_incrementRecoverRetry guards the MaxRecoverRetry escalation counter used by solveDeletion
+// (D3/D4). The counter must (a) start at 1 on a fresh CR, (b) monotonically increase across
+// successive reconcile retries, (c) persist as a string annotation that survives re-read, and
+// (d) tolerate a corrupt / non-numeric prior value by resetting from 1.
+//
+// SCOPE NOTE: this only unit-tests the counter primitive. The control-flow defects documented in
+// docs/fault-injection-enhance-test-report.md §2.A (solveDeletion's early-return severs the only
+// path that actually issues node recover — statusProcess) and §2.B (new statuses have no case in
+// statusProcess's switch) are NOT covered here: reproducing them needs an envtest integration test,
+// which this machine cannot run (setup-envtest not installed; CRD yaml not regenerated for the new
+// statuses because controller-gen crashes on Go 1.26). Those remain static-control-flow findings.
+func Test_incrementRecoverRetry(t *testing.T) {
+	// Fresh CR: no annotation yet -> first retry == 1, annotation persisted.
+	inst := &v1alpha1.Experiment{ObjectMeta: metav1.ObjectMeta{Annotations: nil}}
+	n := incrementRecoverRetry(inst)
+	assert.Equal(t, 1, n, "first retry should be 1")
+	assert.Equal(t, "1", inst.ObjectMeta.Annotations[recoverRetryKey], "annotation persisted as %q")
+
+	// Three more retries -> 2, 3, 4, monotonically, re-reading the persisted value each time.
+	for want := 2; want <= 4; want++ {
+		got := incrementRecoverRetry(inst)
+		assert.Equal(t, want, got, "retry should monotonically increment to %d", want)
+		assert.Equal(t, strconv.Itoa(want), inst.ObjectMeta.Annotations[recoverRetryKey])
+	}
+
+	// Tolerate a corrupt (non-numeric) prior annotation: reset to 1, not panic.
+	inst2 := &v1alpha1.Experiment{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{recoverRetryKey: "garbage"},
+	}}
+	got := incrementRecoverRetry(inst2)
+	assert.Equal(t, 1, got, "corrupt prior value should reset to 1")
+	assert.Equal(t, "1", inst2.ObjectMeta.Annotations[recoverRetryKey])
+
+	// A valid high prior value is honoured: 7 -> 8 (the MaxRecoverRetry boundary).
+	inst3 := &v1alpha1.Experiment{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{recoverRetryKey: "7"},
+	}}
+	got = incrementRecoverRetry(inst3)
+	assert.Equal(t, 8, got, "valid prior 7 should bump to 8 (MaxRecoverRetry boundary)")
+	assert.Equal(t, "8", inst3.ObjectMeta.Annotations[recoverRetryKey])
 }

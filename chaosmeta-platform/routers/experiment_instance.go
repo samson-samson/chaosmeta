@@ -29,4 +29,10 @@ func experimentInstanceInit() {
 	beego.Router(NewWebServicePath("experiments/results/:uuid/nodes/:node_id/subtasks/:id"), &experiment_instance.ExperimentInstanceController{}, "get:GetExperimentInstanceNodeSubtask")
 	beego.Router(NewWebServicePath("experiments/results/:uuid"), &experiment_instance.ExperimentInstanceController{}, "delete:DeleteExperimentInstance")
 	beego.Router(NewWebServicePath("experiments/results"), &experiment_instance.ExperimentInstanceController{}, "delete:DeleteExperimentInstances")
+
+	// D11 / D12 backend endpoints for the Task 1 frontend panels.
+	//   logs   → persisted + tailable log lines for an experiment instance
+	//   metrics → aggregated process data (success rate, latency placeholder, error counts, node breakdown)
+	beego.Router(NewWebServicePath("experiments/:uuid/logs"), &experiment_instance.ExperimentInstanceController{}, "get:GetExperimentInstanceLogs")
+	beego.Router(NewWebServicePath("experiments/:uuid/metrics"), &experiment_instance.ExperimentInstanceController{}, "get:GetExperimentInstanceMetrics")
 }

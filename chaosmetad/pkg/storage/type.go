@@ -30,4 +30,11 @@ type Experiment struct {
 	UpdateTime       string `json:"update_time"`
 	ContainerId      string `json:"container_id"`
 	ContainerRuntime string `json:"container_runtime"`
+
+	// Trackable auto-recover timer (added in enhancement).
+	// OrphanPid: PID of the detached `sleep N; chaosmetad recover <uid>` process, 0 if none forked.
+	// RecoverDeadline: unix timestamp (seconds) when the orphan timer was scheduled to fire, 0 if unknown (legacy record).
+	// Used to safely distinguish "timer still alive, do NOT sweep" from "timer lost + past deadline, true residue".
+	OrphanPid       int   `gorm:"default:0" json:"orphan_pid"`
+	RecoverDeadline int64 `gorm:"default:0" json:"recover_deadline"`
 }

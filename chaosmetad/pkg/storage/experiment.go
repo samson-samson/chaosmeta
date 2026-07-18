@@ -24,13 +24,13 @@ import (
 	"time"
 )
 
-var globalExpStorage *experimentStore
+var globalExpStorage *ExperimentStore
 
-type experimentStore struct {
+type ExperimentStore struct {
 	db *dbStorage
 }
 
-func GetExperimentStore() (*experimentStore, error) {
+func GetExperimentStore() (*ExperimentStore, error) {
 	if globalExpStorage == nil {
 		db, err := newDBStorage()
 		if err != nil {
@@ -45,15 +45,15 @@ func GetExperimentStore() (*experimentStore, error) {
 	return globalExpStorage, nil
 }
 
-func newExperimentStore(db *dbStorage) (*experimentStore, error) {
+func newExperimentStore(db *dbStorage) (*ExperimentStore, error) {
 	if err := db.AutoMigrate(&Experiment{}); err != nil {
 		return nil, err
 	}
 
-	return &experimentStore{db}, nil
+	return &ExperimentStore{db}, nil
 }
 
-func (e *experimentStore) Insert(exp *Experiment) error {
+func (e *ExperimentStore) Insert(exp *Experiment) error {
 	nowTime := time.Now().Format(utils.TimeFormat)
 	exp.CreateTime, exp.UpdateTime = nowTime, nowTime
 	if err := e.db.Model(Experiment{}).
@@ -65,7 +65,7 @@ func (e *experimentStore) Insert(exp *Experiment) error {
 	return nil
 }
 
-func (e *experimentStore) Update(exp *Experiment) error {
+func (e *ExperimentStore) Update(exp *Experiment) error {
 	exp.UpdateTime = time.Now().Format(utils.TimeFormat)
 	if err := e.db.Model(Experiment{}).
 		Where("uid = ?", exp.Uid).
@@ -77,7 +77,7 @@ func (e *experimentStore) Update(exp *Experiment) error {
 	return nil
 }
 
-func (e *experimentStore) UpdateStatus(uid, status string) error {
+func (e *ExperimentStore) UpdateStatus(uid, status string) error {
 	if err := e.db.Model(Experiment{}).
 		Where("uid = ?", uid).
 		Updates(Experiment{Status: status, UpdateTime: time.Now().Format(utils.TimeFormat)}).
@@ -88,7 +88,7 @@ func (e *experimentStore) UpdateStatus(uid, status string) error {
 	return nil
 }
 
-func (e *experimentStore) UpdateStatusAndErr(uid, status, errMsg string) error {
+func (e *ExperimentStore) UpdateStatusAndErr(uid, status, errMsg string) error {
 	if err := e.db.Model(Experiment{}).
 		Where("uid = ?", uid).
 		Updates(Experiment{Status: status, Error: errMsg, UpdateTime: time.Now().Format(utils.TimeFormat)}).
@@ -99,7 +99,7 @@ func (e *experimentStore) UpdateStatusAndErr(uid, status, errMsg string) error {
 	return nil
 }
 
-func (e *experimentStore) GetByUid(uid string) (*Experiment, error) {
+func (e *ExperimentStore) GetByUid(uid string) (*Experiment, error) {
 	var exp = &Experiment{}
 	if err := e.db.Model(Experiment{}).
 		Where("uid = ?", uid).
@@ -114,7 +114,41 @@ func (e *experimentStore) GetByUid(uid string) (*Experiment, error) {
 	return exp, nil
 }
 
-func (e *experimentStore) QueryByOption(uid, status, target, fault, creator, cr, cId string, offset, limit uint) ([]*Experiment, int64, error) {
+// UpdateOrphan tracks the detached auto-recover timer for an experiment.
+// orphanPid=0 + deadline=0 clears it (e.g. after recover completes or timer is killed).
+func (e *ExperimentStore) UpdateOrphan(uid string, orphanPid int, deadline int64) error {
+	if err := e.db.Model(Experiment{}).
+		Where("uid = ?", uid).
+		Updates(Experiment{
+			OrphanPid:       orphanPid,
+			RecoverDeadline: deadline,
+			UpdateTime:      time.Now().Format(utils.TimeFormat),
+		}).
+		Error; err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ListByStatus returns all experiments matching any of the given statuses (used by startup stale scan).
+func (e *ExperimentStore) ListByStatus(statuses ...string) ([]*Experiment, error) {
+	var exps []*Experiment
+	if len(statuses) == 0 {
+		return exps, nil
+	}
+	if err := e.db.Model(Experiment{}).
+		Where("status IN ?", statuses).
+		Order("create_time ASC").
+		Find(&exps).
+		Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+
+	return exps, nil
+}
+
+func (e *ExperimentStore) QueryByOption(uid, status, target, fault, creator, cr, cId string, offset, limit uint) ([]*Experiment, int64, error) {
 	var exps []*Experiment
 	db := e.db.Model(Experiment{})
 

@@ -30,13 +30,42 @@ import (
 	"github.com/traas-stack/chaosmeta/chaosmetad/pkg/utils/user"
 	"runtime/debug"
 	"strings"
+	"sync"
 )
+
+// uidLocks (D7 fix): per-uid mutex for inject/recover to prevent concurrent double-recover /
+// double-inject racing the same experiment. Lazily created entries are kept bounded by the
+// fuzzer map below; entries for finished uids are harmless (just small) but we cap via an
+// LRU-ish clear-on-grow to keep 7x24h memory flat.
+var (
+	uidLockMu sync.Mutex
+	uidLocks  = make(map[string]*sync.Mutex)
+)
+
+func uidMutex(uid string) *sync.Mutex {
+	uidLockMu.Lock()
+	defer uidLockMu.Unlock()
+	mu, ok := uidLocks[uid]
+	if !ok {
+		mu = &sync.Mutex{}
+		uidLocks[uid] = mu
+		// Bound the map: if it grows large, drop entries for ids we don't currently hold.
+		// Cheap full clear is safe because each in-flight caller already holds its own *sync.Mutex pointer.
+		if len(uidLocks) > 4096 {
+			uidLocks = make(map[string]*sync.Mutex, 64)
+		}
+	}
+	return mu
+}
 
 type IInjector interface {
 	SetCommonArgs(info *BaseInfo)
 	OptionToExp(args, r interface{}) (*storage.Experiment, error)
 	LoadInjector(exp *storage.Experiment, argsVar, rVar interface{}) error
 	DelayRecover(ctx context.Context, timeout int64) error
+	// DelayRecoverWithPid forks the detached auto-recover orphan and returns its pid + fire deadline.
+	// Implemented on BaseInjector; sub-injectors inherit it via embedding, so all implement the interface.
+	DelayRecoverWithPid(ctx context.Context, timeout int64) (int, int64, error)
 
 	GetArgs() interface{}
 	GetRuntime() interface{}
@@ -126,7 +155,12 @@ func (i *BaseInjector) Inject(ctx context.Context) error {
 }
 
 func (i *BaseInjector) Recover(ctx context.Context) error {
-	if i.Info.Status == utils.StatusDestroyed || i.Info.Status == utils.StatusError {
+	// D5 fix: do NOT short-circuit on StatusError. An error status means the fault may
+	// still be resident, so it MUST fall through to the concrete injector's real recover.
+	// Only StatusDestroyed (already cleaned) is idempotently skipped.
+	// (Previously `|| i.Info.Status == utils.StatusError` here caused every sub-injector's
+	//  delegate `if BaseInjector.Recover()==nil { return nil }` to no-op, permanently stranding faults.)
+	if i.Info.Status == utils.StatusDestroyed {
 		return nil
 	}
 
@@ -184,6 +218,14 @@ func (i *BaseInjector) Validator(ctx context.Context) error {
 
 func (i *BaseInjector) DelayRecover(ctx context.Context, timeout int64) error {
 	return cmdexec.StartSleepRecover(ctx, timeout, i.Info.Uid)
+}
+
+// DelayRecoverWithPid forks the detached auto-recover orphan and returns its pid + fire deadline.
+// Used by ProcessInject to persist trackable timer info (orphan_pid / recover_deadline) so that
+// stop/pause can kill the exact timer and the startup stale-scan can tell "timer alive" from
+// "timer lost".
+func (i *BaseInjector) DelayRecoverWithPid(ctx context.Context, timeout int64) (int, int64, error) {
+	return cmdexec.StartSleepRecoverWithPid(ctx, timeout, i.Info.Uid)
 }
 
 func (i *BaseInjector) LoadInjector(exp *storage.Experiment, argsVar, rVar interface{}) error {
@@ -292,8 +334,14 @@ func ProcessInject(ctx context.Context, i IInjector) (code int, msg string) {
 
 	if exp.Timeout != "" {
 		timeSecond, _ := utils.GetTimeSecond(exp.Timeout)
-		if err := i.DelayRecover(ctx, timeSecond); err != nil {
-			logger.Warnf("inject success but auto delay recover cmd exec error: %s, please execute [chaosmetad recover -u %s] manually to recover", err.Error(), exp.Uid)
+		pid, deadline, derr := i.DelayRecoverWithPid(ctx, timeSecond)
+		if derr != nil {
+			logger.Warnf("inject success but auto delay recover cmd exec error: %s, please execute [chaosmetad recover -u %s] manually to recover", derr.Error(), exp.Uid)
+		} else {
+			// Persist the trackable timer so stop/pause/stale-scan can act precisely.
+			if err := db.UpdateOrphan(exp.Uid, pid, deadline); err != nil {
+				logger.Warnf("update orphan timer info for experiment[%s] error: %s", exp.Uid, err.Error())
+			}
 		}
 	}
 
@@ -311,6 +359,12 @@ func ProcessRecover(ctx context.Context, uid string) (code int, msg string) {
 	}()
 
 	logger.Debugf("uid: %s", uid)
+
+	// D7 fix: serialize per-uid recover so concurrent recover / recover-during-inject cannot
+	// interleave and corrupt state or double-clean.
+	mu := uidMutex(uid)
+	mu.Lock()
+	defer mu.Unlock()
 
 	db, err := storage.GetExperimentStore()
 	if err != nil {
@@ -339,6 +393,10 @@ func ProcessRecover(ctx context.Context, uid string) (code int, msg string) {
 
 	if err := db.UpdateStatus(uid, utils.StatusDestroyed); err != nil {
 		logger.Warnf("update status[%s] for experiment[%s] error: %s", utils.StatusDestroyed, uid, err.Error())
+	}
+	// Clear the trackable timer (it has either fired into this recover, or stop killed it).
+	if err := db.UpdateOrphan(uid, 0, 0); err != nil {
+		logger.Warnf("clear orphan timer info for experiment[%s] error: %s", uid, err.Error())
 	}
 
 	return errutil.NoErr, "success"

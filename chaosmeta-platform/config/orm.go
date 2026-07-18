@@ -39,7 +39,7 @@ func Setup() {
 		new(agent.Agent),
 		new(basic.Scope), new(basic.Target), new(basic.Fault), new(basic.FlowInject), new(basic.MeasureInject), new(basic.Args),
 		new(experiment.WorkflowNode), new(experiment.LabelExperiment), new(experiment.FaultRange), new(experiment.FlowRange), new(experiment.MeasureRange), new(experiment.Experiment), new(experiment.ArgsValue),
-		new(experiment_instance.WorkflowNodeInstance), new(experiment_instance.LabelExperimentInstance), new(experiment_instance.FaultRangeInstance), new(experiment_instance.FlowRangeInstance), new(experiment_instance.MeasureRangeInstance), new(experiment_instance.ExperimentInstance), new(experiment_instance.ArgsValueInstance),
+		new(experiment_instance.WorkflowNodeInstance), new(experiment_instance.LabelExperimentInstance), new(experiment_instance.FaultRangeInstance), new(experiment_instance.FlowRangeInstance), new(experiment_instance.MeasureRangeInstance), new(experiment_instance.ExperimentInstance), new(experiment_instance.ArgsValueInstance), new(experiment_instance.ExperimentInstanceLog),
 	)
 
 	ticker := time.NewTicker(5 * time.Second)

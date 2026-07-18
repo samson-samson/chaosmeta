@@ -9,13 +9,15 @@ import {
   Space,
   Tabs,
   TabsProps,
-  Tag,
   message,
 } from 'antd';
 import { useEffect, useState } from 'react';
 // import ArrangeContent from './ArrangeContent';
 // import InfoDrawer from './components/InfoDrawer';
 // import ArrangeInfoShow from './ArrangeInfoShow';
+import MetricsPanel from '@/components/ExperimentRun/MetricsPanel';
+import RealtimeLogPanel from '@/components/ExperimentRun/RealtimeLogPanel';
+import RunStatusBadge from '@/components/ExperimentRun/RunStatusBadge';
 import { experimentResultStatus } from '@/constants';
 import {
   queryExperimentResultArrangeNodeDetail,
@@ -30,7 +32,6 @@ import {
 } from '@/utils/format';
 import { ExclamationCircleFilled } from '@ant-design/icons';
 import ArrangeInfoShow from '../ExperimentDetail/ArrangeInfoShow';
-import ShowLog from './ShowLog';
 import { Container } from './style';
 
 const AddExperiment = () => {
@@ -148,14 +149,19 @@ const AddExperiment = () => {
     {
       key: 'log',
       label: intl.formatMessage({ id: 'experimentLog' }),
-      children: <ShowLog message={curNodeDetail?.message || ''} />,
+      // D11: real-time streaming log (SSE + poll fallback) replaces the one-shot ShowLog dump.
+      children: (
+        <RealtimeLogPanel experimentInstanceUUID={resultDetail?.uuid || ''} />
+      ),
     },
-    // todo -- 后端暂不支持
-    // {
-    //   key: 'index',
-    //   label: `实验观测指标`,
-    //   children: <ObservationCharts />,
-    // },
+    // D12: real process-data visualization replaces the commented-out ObservationCharts placeholder.
+    {
+      key: 'index',
+      label: `实验观测指标`,
+      children: (
+        <MetricsPanel experimentInstanceUUID={resultDetail?.uuid || ''} />
+      ),
+    },
   ];
 
   /**
@@ -182,12 +188,11 @@ const AddExperiment = () => {
   };
 
   const renderTitle = () => {
+    // D10: unified status badge from any backend/CRD/Argo source.
     return (
-      <div>
-        {resultDetail?.name}{' '}
-        <Tag color={handleMateStatus()?.color}>
-          {getIntlLabel(handleMateStatus())}
-        </Tag>
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+        {resultDetail?.name}
+        <RunStatusBadge status={resultDetail?.status} />
       </div>
     );
   };

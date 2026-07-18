@@ -60,8 +60,9 @@ const (
 // task status
 const (
 	StatusCreated   = "created"
-	StatusSuccess   = "success"
-	StatusError     = "error"
+	StatusSuccess   = "success" // injection applied, fault currently resident (auto-recover timer pending)
+	StatusPaused    = "paused"  // user-paused (process-type only: SIGSTOP + orphan timer killed)
+	StatusError     = "error"   // abnormal: fault may still be resident, needs stop/manual recover
 	StatusDestroyed = "destroyed"
 )
 

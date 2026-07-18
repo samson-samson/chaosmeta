@@ -19,6 +19,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/traas-stack/chaosmeta/chaosmetad/pkg/injector"
 	"github.com/traas-stack/chaosmeta/chaosmetad/pkg/log"
 	"github.com/traas-stack/chaosmeta/chaosmetad/pkg/utils"
 	"github.com/traas-stack/chaosmeta/chaosmetad/pkg/utils/errutil"
@@ -62,6 +63,10 @@ func NewServerCommand() *cobra.Command {
 			ctx := utils.GetCtxWithTraceId(context.Background(), "system")
 			go watchSignal(ctx)
 
+			// D6 fix: startup stale-recovery backstop. Runs an immediate sweep then a periodic loop.
+			// Strictly safe: never sweeps experiments whose auto-recover timer is still alive.
+			go injector.RunStaleScanLoop(ctx)
+
 			//if cert != "" && key != "" {
 			//	startHTTPSServer(addr, port, isPprof, cert, key)
 			//} else {
@@ -72,7 +77,7 @@ func NewServerCommand() *cobra.Command {
 
 	cmd.Flags().StringVarP(&addr, "addr", "a", "0.0.0.0", "service bind addr")
 	cmd.Flags().StringVarP(&port, "port", "p", "29595", "service bind port")
-	cmd.Flags().BoolVar(&isPprof, "enable-pprof", true, "if open pprof service")
+	cmd.Flags().BoolVar(&isPprof, "enable-pprof", false, "if open pprof service (D14 fix: default off — opt-in only, keeps /debug/pprof out of production blast radius)")
 	//cmd.Flags().StringVarP(&cert, "cert", "c", "", "path to certificate file")
 	//cmd.Flags().StringVarP(&key, "key", "k", "", "path to private key file")
 	// HTTPS
