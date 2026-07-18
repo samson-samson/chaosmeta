@@ -10,7 +10,19 @@ export interface UseExperimentActionOpts {
 
 export interface ExperimentActionResult {
   loading: Record<ActionKind, boolean>;
-  run: (kind: ActionKind, experimentInstanceUUID: string) => Promise<boolean>;
+  /**
+   * Execute an action. uuidNature differs by action (verified against the real backend routes,
+   * see design v3.1 §9.2):
+   *   - start  → experiment UUID   (POST /experiments/:experimentUUID/start)
+   *   - stop   → instance UUID     (POST /experiments/:instanceUUID/stop  → UserStopExperiment)
+   *   - pause  / resume → instance UUID (new routes aligned with stop)
+   * The caller must pass both ids; passing a single uuid for all actions was the v3 bug that broke stop.
+   */
+  run: (
+    kind: ActionKind,
+    experimentInstanceUUID: string,
+    experimentUUID?: string,
+  ) => Promise<boolean>;
 }
 
 const LOADING_LABEL: Record<ActionKind, string> = {
@@ -35,9 +47,16 @@ const SUCCESS_LABEL: Record<ActionKind, string> = {
  *   - success: `message.success` toast
  *   - error:   `notification.error` with the server / network reason — NEVER silently swallowed (D13)
  *
- * Deploys a best-effort PUT/POST to the backend stop/start endpoints. The exact verb/path can vary
- * by deployment; the default matches design §1.6. A 404 is treated as "action channel not wired yet"
- * and surfaced as a clear notification rather than a crash, so pages ship safely ahead of the backend.
+ * Backend verbs (verified, routers/experiment.go):
+ *   - start  : POST {apiPrefix}/experiments/:experimentUUID/start   (experiment UUID!)
+ *   - stop   : POST {apiPrefix}/experiments/:instanceUUID/stop      (instance UUID!)
+ *   - pause  : POST {apiPrefix}/experiments/:instanceUUID/pause     (new, aligned with stop)
+ *   - resume : POST {apiPrefix}/experiments/:instanceUUID/resume    (new)
+ * start therefore needs the EXPERIMENT uuid; stop / pause / resume need the INSTANCE uuid.
+ * A 404 is treated as "action channel not wired yet" and surfaced as a clear warning rather than a crash,
+ * so pages ship safely ahead of the backend.
+ *
+ * G0 (v3.1 §9.1): stop now works from Running / Paused / Error after the webhook + routine放开.
  */
 export default function useExperimentAction({
   apiPrefix = '/chaosmeta/api/v1',
@@ -53,20 +72,38 @@ export default function useExperimentAction({
     async (
       kind: ActionKind,
       experimentInstanceUUID: string,
+      experimentUUID?: string,
     ): Promise<boolean> => {
+      // v3.1 §9.2: start needs the EXPERIMENT uuid; the rest need the INSTANCE uuid.
+      const routeUUID =
+        kind === 'start' ? experimentUUID : experimentInstanceUUID;
+      // codex-review-2: pause/resume are intentionally NOT backed — the operator has no pause phase
+      // handler (solveFinalStatus only acts on recover), so wiring a route would be an empty shell.
+      // Surfacing an honest "暂未启用" notice is better than a 404 or a fake success. stop/start are real.
+      if (kind === 'pause' || kind === 'resume') {
+        notification.warning({
+          message: `${kind === 'pause' ? '暂停' : '恢复'}暂未启用`,
+          description:
+            '底层 operator 暂未落地 pause-phase-handler（需 chaosmetad 进程级 SIGSTOP 原语 + 集群验证）。停止/启动可用。',
+        });
+        return false;
+      }
+      if (!routeUUID) {
+        notification.error({
+          message: `${kind} 失败`,
+          description:
+            kind === 'start'
+              ? '缺少实验 UUID，无法启动'
+              : '缺少实验实例 UUID，无法操作',
+        });
+        return false;
+      }
       setLoading((s) => ({ ...s, [kind]: true }));
       const hide = message.loading(LOADING_LABEL[kind], 0);
       try {
-        // Align with the real backend verbs/paths:
-        //   start/stop exist:  POST {apiPrefix}/experiments/:uuid/start | /stop  (see routers/experiment.go)
-        //   pause/resume are not yet backed (design §2.1.1: pause only for process-type faults, chaosmetad
-        //   has no pause primitive yet). They hit a best-effort path and surface a clear 404 warning (D13)
-        //   rather than pretending success.
-        const verb =
-          kind === 'stop' ? 'stop' : kind === 'start' ? 'start' : kind; // pause / resume — backend not wired
         const path = `${apiPrefix}/experiments/${encodeURIComponent(
-          experimentInstanceUUID,
-        )}/${verb}`;
+          routeUUID,
+        )}/${kind}`;
         const resp = await fetch(path, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

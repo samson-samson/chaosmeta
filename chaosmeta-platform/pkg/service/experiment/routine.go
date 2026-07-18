@@ -430,7 +430,11 @@ func UserStopExperiment(experimentInstanceID string) error {
 	if err != nil || experimentInstanceInfo == nil {
 		return fmt.Errorf("can not find experimentInstance")
 	}
-	if experimentInstanceInfo.Status == WorkflowSucceeded || experimentInstanceInfo.Status == WorkflowFailed || experimentInstanceInfo.Status == WorkflowError {
+	// G0 (v3.1 §9.1): a clean terminal (Succeeded/Failed) is genuinely done — refuse re-stop.
+	// BUT WorkflowError means "stop incomplete, nodes not confirmed clean" (see StopExperiment → confirmRecoverCompleted):
+	// the fault may STILL be resident, so Error must be re-stoppable to let the operator issue another recover.
+	// This unblocks the Task-2 hard requirement: stop must recover from ANY state (incl. Error) back to clean.
+	if experimentInstanceInfo.Status == WorkflowSucceeded || experimentInstanceInfo.Status == WorkflowFailed {
 		return errors.New("experiment is over")
 	}
 	return StopExperiment(experimentInstanceID, false)

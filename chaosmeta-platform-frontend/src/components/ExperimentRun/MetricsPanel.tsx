@@ -1,6 +1,7 @@
 import { Card, Col, Empty, Row, Spin, Table } from 'antd';
 import * as echarts from 'echarts';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { fiTokens } from './fi-tokens';
 
 export interface MetricsData {
   successRate: number; // 0..1
@@ -108,13 +109,18 @@ export default function MetricsPanel({
             endAngle: -20,
             min: 0,
             max: 100,
-            progress: { show: true, width: 14 },
-            axisLine: { lineStyle: { width: 14 } },
+            progress: { show: true, width: 14, itemStyle: { color: fiTokens.chartPrimary } },
+            axisLine: { lineStyle: { width: 14, color: [[1, fiTokens.border]] } },
+            axisTick: { show: false },
+            splitLine: { lineStyle: { color: fiTokens.border } },
+            axisLabel: { color: fiTokens.textTertiary, distance: 14, fontSize: 10 },
             detail: {
               valueAnimation: true,
               formatter: '{value}%',
-              fontSize: 22,
+              fontSize: 26,
+              fontWeight: 700,
               offsetCenter: [0, '40%'],
+              color: fiTokens.textPrimary,
             },
             data: [
               {
@@ -143,10 +149,10 @@ export default function MetricsPanel({
         : [lat?.p50 ?? 0, lat?.p90 ?? 0, lat?.p99 ?? 0, lat?.max ?? 0];
       c.setOption({
         tooltip: { trigger: 'axis', valueFormatter: (v: number) => `${v} ms` },
-        xAxis: { type: 'category', data: xLabels },
-        yAxis: { type: 'value', name: 'ms' },
+        xAxis: { type: 'category', data: xLabels, axisLine: { lineStyle: { color: fiTokens.border } } },
+        yAxis: { type: 'value', name: 'ms', splitLine: { lineStyle: { color: fiTokens.borderSubtle } } },
         series: [
-          { type: 'bar', data: values, itemStyle: { color: '#5b8ff9' } },
+          { type: 'bar', data: values, itemStyle: { color: fiTokens.chartPrimary, borderRadius: [4, 4, 0, 0] } },
         ],
         grid: { left: 48, right: 16, top: 24, bottom: 32 },
       });
@@ -161,13 +167,17 @@ export default function MetricsPanel({
           type: 'category',
           data: data.errors.map((e) => e.type),
           axisLabel: { rotate: 20 },
+          axisLine: { lineStyle: { color: fiTokens.border } },
         },
-        yAxis: { type: 'value' },
+        yAxis: {
+          type: 'value',
+          splitLine: { lineStyle: { color: fiTokens.borderSubtle } },
+        },
         series: [
           {
             type: 'bar',
             data: data.errors.map((e) => e.count),
-            itemStyle: { color: '#ff5c5c' },
+            itemStyle: { color: fiTokens.chartNegative, borderRadius: [4, 4, 0, 0] },
           },
         ],
         grid: { left: 40, right: 16, top: 16, bottom: 48 },
@@ -185,14 +195,30 @@ export default function MetricsPanel({
   const nodeColumns = useMemo(
     () => [
       { title: '节点', dataIndex: 'node', key: 'node' },
-      { title: '注入', dataIndex: 'inject', key: 'inject' },
-      { title: '恢复', dataIndex: 'recover', key: 'recover' },
+      {
+        title: '注入',
+        dataIndex: 'inject',
+        key: 'inject',
+        render: (v: number) => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{v}</span>,
+      },
+      {
+        title: '恢复',
+        dataIndex: 'recover',
+        key: 'recover',
+        render: (v: number) => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{v}</span>,
+      },
       {
         title: '失败',
         dataIndex: 'fail',
         key: 'fail',
         render: (v: number) =>
-          v > 0 ? <span style={{ color: '#ff5c5c' }}>{v}</span> : v,
+          v > 0 ? (
+            <span style={{ color: fiTokens.chartNegative, fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
+              {v}
+            </span>
+          ) : (
+            <span style={{ fontVariantNumeric: 'tabular-nums' }}>0</span>
+          ),
       },
     ],
     [],
@@ -200,14 +226,14 @@ export default function MetricsPanel({
 
   if (loading) {
     return (
-      <div style={{ textAlign: 'center', padding: 40 }}>
+      <div style={{ textAlign: 'center', padding: 48 }}>
         <Spin />
       </div>
     );
   }
   if (error && !data) {
     return (
-      <Card size="small">
+      <Card size="small" style={{ borderColor: fiTokens.border }}>
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={error} />
       </Card>
     );
@@ -216,16 +242,21 @@ export default function MetricsPanel({
     return <Empty description="暂无过程数据" />;
   }
 
+  const cardHead = { padding: '8px 16px', borderBottom: `1px solid ${fiTokens.borderSubtle}` };
+  const cardBody = { padding: 12 };
+
   return (
     <Row gutter={[12, 12]}>
       <Col xs={24} sm={12} md={6}>
-        <Card size="small" title="成功率" bodyStyle={{ height: 180 }}>
-          <div ref={gaugeRef} style={{ height: 150 }} />
+        <Card size="small" title="注入成功率" styles={{ header: cardHead, body: { ...cardBody, height: 188 } }}>
+          <div ref={gaugeRef} style={{ height: 152 }} />
           <div
             style={{
               textAlign: 'center',
-              color: 'rgba(0,0,0,0.45)',
+              color: fiTokens.textSecondary,
               fontSize: 12,
+              fontVariantNumeric: 'tabular-nums',
+              marginTop: 2,
             }}
           >
             共 {data.total} · 成功 {data.succeeded} · 失败 {data.failed}
@@ -233,12 +264,12 @@ export default function MetricsPanel({
         </Card>
       </Col>
       <Col xs={24} sm={12} md={9}>
-        <Card size="small" title="延迟分布 (ms)" bodyStyle={{ height: 180 }}>
+        <Card size="small" title="延迟分布 (ms)" styles={{ header: cardHead, body: { ...cardBody, height: 188 } }}>
           <div ref={latencyRef} style={{ height: 160 }} />
         </Card>
       </Col>
       <Col xs={24} md={9}>
-        <Card size="small" title="错误计数" bodyStyle={{ height: 180 }}>
+        <Card size="small" title="错误计数" styles={{ header: cardHead, body: { ...cardBody, height: 188 } }}>
           {data.errors?.length ? (
             <div ref={errorsRef} style={{ height: 160 }} />
           ) : (
@@ -251,7 +282,7 @@ export default function MetricsPanel({
         </Card>
       </Col>
       <Col span={24}>
-        <Card size="small" title="节点维度明细" bodyStyle={{ padding: 0 }}>
+        <Card size="small" title="节点维度明细" styles={{ header: cardHead, body: { padding: 0 } }}>
           <Table
             size="small"
             rowKey="node"

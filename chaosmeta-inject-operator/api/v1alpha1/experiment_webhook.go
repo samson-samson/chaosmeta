@@ -170,6 +170,7 @@ func (r *Experiment) ValidateUpdate(old runtime.Object) error {
 		return nil
 	}
 
+	// Existing safe invariant: never allow changing the injection configuration mid-run.
 	if !reflect.DeepEqual(r.Spec.Experiment, oldExp.Spec.Experiment) ||
 		!reflect.DeepEqual(r.Spec.Selector, oldExp.Spec.Selector) ||
 		!reflect.DeepEqual(r.Spec.RangeMode, oldExp.Spec.RangeMode) ||
@@ -177,15 +178,49 @@ func (r *Experiment) ValidateUpdate(old runtime.Object) error {
 		return fmt.Errorf("spec only support update \"targetPhase\"")
 	}
 
-	if !(oldExp.Status.Phase == InjectPhaseType && (oldExp.Status.Status == SuccessStatusType || oldExp.Status.Status == FailedStatusType || oldExp.Status.Status == PartSuccessStatusType)) {
-		return fmt.Errorf("only support update when \"status.phase == inject and status.status == success/failed/partSuccess\"")
+	// G0 (v3.1 §9.1, codex-review-2): allow targetPhase=RECOVER updates from MORE states than just the
+	// inject-terminal set, so a running/paused/error experiment can actually be STOPPED (→ recover). This
+	// unblocks the Task-2 hard requirement: "stop must recover from ANY state back to the pre-injection state".
+	//
+	// PAUSE is intentionally NOT opened here (codex-review-2 finding): opening TargetPhase=Pause would be
+	// an empty shell, because the operator has no pause phase handler — solveFinalStatus only acts on
+	// TargetPhase=Recover, so a pause order would be silently accepted while the injection keeps running.
+	// Building a real pause primitive (SIGSTOP on the orphan auto-recover timer per design §9.4) needs a
+	// chaosmetad process-level change + envtest verification, neither of which this environment can validate.
+	// Per the "do not fabricate untestable behavior" principle, pause wiring stays closed until the operator
+	// side exists; the front-end surfaces a clear "暂未启用" notice rather than pretending it works.
+	//
+	// The only allowed transition is single-directional targetPhase-only (→recover); reverse (recover→inject)
+	// stays rejected so an injection cannot be revived mid-recover.
+	oldPhase, oldStatus := oldExp.Status.Phase, oldExp.Status.Status
+	switch {
+	case oldPhase == InjectPhaseType && (oldStatus == SuccessStatusType || oldStatus == FailedStatusType || oldStatus == PartSuccessStatusType):
+		// legacy: inject-terminal states may only flip targetPhase to recover.
+		if r.Spec.TargetPhase == RecoverPhaseType {
+			return nil
+		}
+		return fmt.Errorf("only can update \"targetPhase\" to \"recover\" from terminal inject states")
+	case oldPhase == InjectPhaseType && oldStatus == RunningStatusType:
+		// running injection: may only stop (→recover). pause NOT opened (see block comment).
+		if r.Spec.TargetPhase == RecoverPhaseType {
+			return nil
+		}
+		return fmt.Errorf("from running inject, targetPhase may only become \"recover\" (pause not yet supported)")
+	case oldPhase == InjectPhaseType && oldStatus == PausedStatusType:
+		// paused injection (a state only reachable once pause lands): only stop is safe here.
+		if r.Spec.TargetPhase == RecoverPhaseType {
+			return nil
+		}
+		return fmt.Errorf("from paused inject, targetPhase may only become \"recover\"")
+	case oldPhase == InjectPhaseType && oldStatus == ErrorStatusType:
+		// error state: fault MAY STILL BE RESIDENT — explicitly allow stop to trigger recover and clean it up.
+		if r.Spec.TargetPhase == RecoverPhaseType {
+			return nil
+		}
+		return fmt.Errorf("from error inject, targetPhase may only become \"recover\"")
+	default:
+		return fmt.Errorf("only support update when \"status.phase == inject and status.status == success/failed/partSuccess/running/paused/error\"")
 	}
-
-	if r.Spec.TargetPhase != RecoverPhaseType {
-		return fmt.Errorf("only can update \"targetPhase\" to \"recover\"")
-	}
-
-	return nil
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type

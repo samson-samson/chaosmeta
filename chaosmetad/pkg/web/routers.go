@@ -92,6 +92,15 @@ var routes = Routes{
 	},
 
 	Route{
+		"ExperimentMetricsGet",
+		strings.ToUpper("Get"),
+		"/v1/experiment/metrics",
+		// G3 (v3.1 §9.5): process-data endpoint — aggregated injection success/resident counts
+		// derivable from existing storage columns. latency reported as unavailable (see handler doc).
+		handler.ExperimentMetricsGet,
+	},
+
+	Route{
 		"VersionGet",
 		strings.ToUpper("Get"),
 		"/v1/version",

@@ -1,7 +1,8 @@
 import { LightArea } from '@/components/CommonStyle';
 import EmptyCustom from '@/components/EmptyCustom';
 import TimeTypeRangeSelect from '@/components/Select/TimeTypeRangeSelect';
-import { experimentStatus, triggerTypes } from '@/constants';
+import { RunStatusBadge } from '@/components/ExperimentRun';
+import { triggerTypes } from '@/constants';
 import {
   createExperiment,
   deleteExperiment,
@@ -22,14 +23,12 @@ import {
 } from '@ant-design/icons';
 import { history, useIntl, useModel, useRequest } from '@umijs/max';
 import {
-  Badge,
   Button,
   Col,
   Dropdown,
   Form,
   Input,
   Modal,
-  Popover,
   Row,
   Select,
   Space,
@@ -336,26 +335,20 @@ const ExperimentList: React.FC<unknown> = () => {
       // sorter: true,
       dataIndex: 'last_instance',
       render: (text: string, record: any) => {
-        const statusTemp: any = experimentStatus.filter(
-          (item) => item.value === record?.status,
-        )[0];
+        // §1 color-not-only: unified badge (icon + tone) replaces the legacy color-only dot.
         return (
           <div
             style={{
               display: 'flex',
               alignItems: 'center',
+              gap: 8,
             }}
           >
-            <div>
-              <Popover
-                title={getIntlLabel(statusTemp)}
-                overlayStyle={{ textAlign: 'center' }}
-              >
-                <Badge color={statusTemp?.color} />{' '}
-              </Popover>
-              {/* 这里展示时间 -- 后端没有相应字段 --todo */}
-              <span>{formatTime(record?.last_instance)}</span>
-            </div>
+            <RunStatusBadge status={record?.status} />
+            {/* 这里展示时间 -- 后端没有相应字段 --todo */}
+            <span style={{ fontVariantNumeric: 'tabular-nums' }}>
+              {formatTime(record?.last_instance)}
+            </span>
           </div>
         );
       },

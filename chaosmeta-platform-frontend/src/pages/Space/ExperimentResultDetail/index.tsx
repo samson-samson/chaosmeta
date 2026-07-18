@@ -1,20 +1,11 @@
 import { PageContainer } from '@ant-design/pro-components';
 import { getLocale, history, useIntl, useRequest } from '@umijs/max';
-import {
-  Alert,
-  Badge,
-  Button,
-  Modal,
-  Progress,
-  Space,
-  Tabs,
-  TabsProps,
-  message,
-} from 'antd';
+import { Alert, Badge, Card, Progress, Space, Tabs, TabsProps } from 'antd';
 import { useEffect, useState } from 'react';
 // import ArrangeContent from './ArrangeContent';
 // import InfoDrawer from './components/InfoDrawer';
 // import ArrangeInfoShow from './ArrangeInfoShow';
+import { ExperimentRunPanel } from '@/components/ExperimentRun';
 import MetricsPanel from '@/components/ExperimentRun/MetricsPanel';
 import RealtimeLogPanel from '@/components/ExperimentRun/RealtimeLogPanel';
 import RunStatusBadge from '@/components/ExperimentRun/RunStatusBadge';
@@ -23,14 +14,12 @@ import {
   queryExperimentResultArrangeNodeDetail,
   queryExperimentResultArrangeNodeList,
   queryExperimentResultDetail,
-  stopExperimentResult,
 } from '@/services/chaosmeta/ExperimentController';
 import {
   arrangeDataOriginTranstion,
   formatDuration,
   getIntlLabel,
 } from '@/utils/format';
-import { ExclamationCircleFilled } from '@ant-design/icons';
 import ArrangeInfoShow from '../ExperimentDetail/ArrangeInfoShow';
 import { Container } from './style';
 
@@ -95,54 +84,19 @@ const AddExperiment = () => {
   );
 
   /**
-   * 停止实验
+   * 停止/启停后重拉详情（G1：主操作面板 ExperimentRunPanel 的 onStatusChanged 回调，
+   * 收到成功动作后刷新当前实例状态，保证顶部按钮与状态徽标同步）
    */
-  const stopExperiment = useRequest(stopExperimentResult, {
-    manual: true,
-    formatResult: (res) => res,
-    onSuccess: (res) => {
-      if (res?.code === 200) {
-        message.success(
-          `${resultDetail?.name}${intl.formatMessage({
-            id: 'experimentResult.stop.text',
-          })}`,
-        );
-        getResultDetail?.run({
-          uuid: history?.location?.query?.resultId as string,
-        });
-      }
-    },
-  });
-
-  /**
-   * 停止实验
-   */
-  const handleDeleteAccount = () => {
-    Modal.confirm({
-      title: intl.formatMessage({ id: 'stopConfirmText' }),
-      icon: <ExclamationCircleFilled />,
-      onOk() {
-        return stopExperiment?.run({ uuid: resultDetail?.uuid });
-      },
+  const refreshAfterAction = () => {
+    getResultDetail?.run({
+      uuid: history?.location?.query?.resultId as string,
     });
   };
 
   const headerExtra = () => {
-    return (
-      <Space>
-        {/* <Button>查看实验配置</Button> */}
-        {resultDetail?.status === 'Running' && (
-          <Button
-            type="primary"
-            onClick={() => {
-              handleDeleteAccount();
-            }}
-          >
-            {intl.formatMessage({ id: 'stop' })}
-          </Button>
-        )}
-      </Space>
-    );
+    // v3.1 G1：启停操作的统一三态反馈由顶部 ExperimentRunPanel 承载，
+    // 页头这里只保留一个与历史一致的"停止"快捷入口，对运行态可点，走同一个面板的语义。
+    return <Space>{/* 操作入口移至下方 ExperimentRunPanel */}</Space>;
   };
 
   const items: TabsProps['items'] = [
@@ -219,6 +173,23 @@ const AddExperiment = () => {
         }}
       >
         <div className="content">
+          {/* v3.1 G1：主操作面板接线——启动/暂停/恢复/停止四按钮 + 统一三态反馈。
+              start 用 experiment_uuid（实验uuid），stop/pause/resume 用实例 uuid（见 useExperimentAction §9.2）。
+              onStatusChanged 在动作成功后重拉详情，保持按钮与状态同步。 */}
+          {resultDetail?.uuid && (
+            <Card
+              size="small"
+              bodyStyle={{ padding: 0 }}
+              style={{ marginBottom: 16, border: 'none' }}
+            >
+              <ExperimentRunPanel
+                experimentInstanceUUID={resultDetail.uuid}
+                experimentUUID={resultDetail?.experiment_uuid}
+                status={resultDetail?.status}
+                onStatusChanged={refreshAfterAction}
+              />
+            </Card>
+          )}
           <div className="content-title">
             <div>{intl.formatMessage({ id: 'experimentProgress' })}</div>
             {/* 后端不支持展示进度，只有成功展示进度条，其他情况展示当前状态 */}

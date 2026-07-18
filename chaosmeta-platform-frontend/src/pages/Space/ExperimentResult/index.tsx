@@ -6,17 +6,17 @@ import { LightArea } from '@/components/CommonStyle';
 import EmptyCustom from '@/components/EmptyCustom';
 import TimeTypeRangeSelect from '@/components/Select/TimeTypeRangeSelect';
 import ShowText from '@/components/ShowText';
+import { RunStatusBadge } from '@/components/ExperimentRun';
 import { experimentResultStatus } from '@/constants';
 import {
   queryExperimentResultList,
   stopExperimentResult,
 } from '@/services/chaosmeta/ExperimentController';
-import { formatTime, getIntlLabel } from '@/utils/format';
+import { formatTime } from '@/utils/format';
 import { useParamChange } from '@/utils/useParamChange';
 import { PageContainer } from '@ant-design/pro-components';
 import { history, useIntl, useModel, useRequest } from '@umijs/max';
 import {
-  Badge,
   Button,
   Col,
   Form,
@@ -208,17 +208,9 @@ const ExperimentResult: React.FC<unknown> = () => {
       width: 100,
       dataIndex: 'status',
       render: (text: string) => {
-        const temp: any = experimentResultStatus?.filter(
-          (item) => item?.value === text,
-        )[0];
-        if (temp) {
-          return (
-            <div>
-              <Badge color={temp?.color} /> {getIntlLabel(temp)}
-            </div>
-          );
-        }
-        return '-';
+        // design-system §1 (color-not-only): use the unified RunStatusBadge (icon + label + tone)
+        // instead of the legacy raw color-only Badge. normalizeRunStatus handles every legacy value.
+        return <RunStatusBadge status={text} />;
       },
     },
   ];

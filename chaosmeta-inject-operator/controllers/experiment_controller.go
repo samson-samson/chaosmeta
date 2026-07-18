@@ -160,18 +160,47 @@ func initProcess(ctx context.Context, instance *v1alpha1.Experiment) {
 
 func statusProcess(ctx context.Context, instance *v1alpha1.Experiment) {
 	handler := phasehandler.GetHandler(instance.Status.Phase)
-
+	// G2 (v3.1 §9.1/§9.4): the new CRD states (Paused/Stopped/Recovering/Error) added in 940e9b9 must
+	// each have an explicit reconcile branch, otherwise a CR in these states silently falls through the
+	// default switch and the state machine stalls. The mapping below keeps every transition safe:
+	//   - Recovering  → let the recover phase handler drive SolveCreated (recover in progress)
+	//   - Paused      → stable parked state; do NOT auto-advance. Wait for user resume (→Running) or
+	//                   stop (TargetPhase=Recover). Idempotent noop, never requeue.
+	//   - Stopped     → clean terminal; nothing to drive (finalizer removal handled in solveDeletion).
+	//   - Error       → abnormal, fault may be resident; do NOT auto-act. A user stop (TargetPhase=Recover
+	//                   already permitted by the G0 webhook/routine放开) is the only safe path forward.
+	// Guard handler!=nil because GetHandler returns nil for unknown phases (e.g. PausePhaseType transient).
 	switch instance.Status.Status {
 	case v1alpha1.CreatedStatusType:
-		handler.SolveCreated(ctx, instance)
+		if handler != nil {
+			handler.SolveCreated(ctx, instance)
+		}
 	case v1alpha1.RunningStatusType:
-		handler.SolveRunning(ctx, instance)
+		if handler != nil {
+			handler.SolveRunning(ctx, instance)
+		}
 	case v1alpha1.SuccessStatusType:
-		handler.SolveSuccess(ctx, instance)
+		if handler != nil {
+			handler.SolveSuccess(ctx, instance)
+		}
 	case v1alpha1.PartSuccessStatusType:
-		handler.SolvePartSuccess(ctx, instance)
+		if handler != nil {
+			handler.SolvePartSuccess(ctx, instance)
+		}
 	case v1alpha1.FailedStatusType:
-		handler.SolveFailed(ctx, instance)
+		if handler != nil {
+			handler.SolveFailed(ctx, instance)
+		}
+	case v1alpha1.RecoveringStatusType:
+		// transition driven by the recover phase handler; treat as recover's "created" step.
+		if handler != nil {
+			handler.SolveCreated(ctx, instance)
+		}
+	case v1alpha1.PausedStatusType:
+		// intentionally parked — no auto-transition. Preserve status; user resume/stop drives next step.
+	case v1alpha1.StoppedStatusType, v1alpha1.ErrorStatusType:
+		// terminal-ish: no reconcile work here. Stopped = clean; Error = needs explicit user stop.
+		// finalizer logic lives in solveDeletion, not here.
 	}
 }
 

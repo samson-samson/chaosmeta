@@ -15,6 +15,7 @@ import {
   message,
 } from 'antd';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { fiTokens } from './fi-tokens';
 
 export interface LogLine {
   /** Monotonic server-side id — used to resume a tail without dupes. */
@@ -42,11 +43,29 @@ const LEVEL_FILTERS = [
 ];
 
 const LEVEL_COLOR: Record<string, string> = {
-  info: 'rgba(255,255,255,0.70)',
-  warn: '#ffb020',
-  error: '#ff5c5c',
-  debug: 'rgba(255,255,255,0.45)',
+  info: fiTokens.levelInfo,
+  warn: fiTokens.levelWarn,
+  error: fiTokens.levelError,
+  debug: fiTokens.levelDebug,
 };
+
+/**
+ * usePrefersReducedMotion — subscribe to the user's OS-level "reduce motion" preference. SSR-safe
+ * (returns false before mount) and cleans up the media-query listener. Used to suppress the live
+ * auto-tail so motion-sensitive users get a calm, manually-scrollable log.
+ */
+function usePrefersReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const apply = () => setReduced(mq.matches);
+    apply();
+    mq.addEventListener?.('change', apply);
+    return () => mq.removeEventListener?.('change', apply);
+  }, []);
+  return reduced;
+}
 
 /**
  * RealtimeLogPanel — real-time operation log for an experiment instance.
@@ -75,13 +94,21 @@ export default function RealtimeLogPanel({
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [level, setLevel] = useState('');
   const [nodeFilter, setNodeFilter] = useState('');
-  const [paused, setPaused] = useState(false);
   const [loading, setLoading] = useState(true);
   const [channelError, setChannelError] = useState<string>('');
   const [sseSupported, setSseSupported] = useState<boolean>(true);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastIdRef = useRef<number>(0);
+
+  // §5 reduced-motion: users who opt out of motion should not get an auto-tailing live stream. We
+  // honour prefers-reduced-motion by defaulting to the paused state (manual scroll only). Polling
+  // still runs so data is fresh when they scroll; only the live-follow animation is suppressed.
+  const prefersReducedMotion = usePrefersReducedMotion();
+  const [paused, setPaused] = useState(false);
+  useEffect(() => {
+    if (prefersReducedMotion) setPaused(true);
+  }, [prefersReducedMotion]);
 
   const fetchHistory = useCallback(async () => {
     try {
@@ -277,7 +304,7 @@ export default function RealtimeLogPanel({
           </Button>
           {!channelError && !paused && (
             <Tooltip title="实时跟随">
-              <CaretDownOutlined style={{ color: '#52c41a' }} />
+              <CaretDownOutlined style={{ color: fiTokens.chartPositive }} />
             </Tooltip>
           )}
         </Space>
@@ -285,12 +312,13 @@ export default function RealtimeLogPanel({
 
       {channelError && (
         <div
+          role="alert"
           style={{
-            color: '#ff5c5c',
+            color: fiTokens.levelError,
             fontSize: 12,
             padding: '4px 8px',
             background: 'rgba(255,92,92,0.08)',
-            borderRadius: 6,
+            borderRadius: fiTokens.radiusCard,
           }}
         >
           {channelError}
@@ -299,16 +327,20 @@ export default function RealtimeLogPanel({
 
       <div
         ref={scrollRef}
+        aria-live="polite"
+        aria-label="实验实时日志"
         style={{
           height,
           overflow: 'auto',
-          background: '#1e1e1e',
-          borderRadius: 8,
+          background: fiTokens.surfaceLog,
+          borderRadius: fiTokens.radiusCard,
           padding: '12px 14px',
-          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontFamily: fiTokens.fontMono,
+          fontVariantNumeric: 'tabular-nums',
           fontSize: 12.5,
           lineHeight: 1.7,
           border: '1px solid rgba(255,255,255,0.06)',
+          scrollBehavior: prefersReducedMotion ? 'auto' : 'smooth',
         }}
       >
         {loading ? (
@@ -327,24 +359,22 @@ export default function RealtimeLogPanel({
               key={l.id ?? `${idx}:${l.message.slice(0, 8)}`}
               style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
             >
-              <span style={{ color: 'rgba(255,255,255,0.35)', marginRight: 8 }}>
+              <span style={{ color: fiTokens.textLogFaint, marginRight: 8 }}>
                 {l.createdAt ?? ''}
               </span>
-              <span style={{ color: 'rgba(255,255,255,0.45)', marginRight: 8 }}>
+              <span style={{ color: fiTokens.textLogDim, marginRight: 8 }}>
                 [{l.node || '-'}]
               </span>
               <span
                 style={{
-                  color: LEVEL_COLOR[l.level] ?? 'rgba(255,255,255,0.7)',
+                  color: LEVEL_COLOR[l.level] ?? fiTokens.textLog,
                   marginRight: 8,
                   fontWeight: 600,
                 }}
               >
                 {l.level.toUpperCase()}
               </span>
-              <span style={{ color: 'rgba(255,255,255,0.85)' }}>
-                {l.message}
-              </span>
+              <span style={{ color: fiTokens.textLog }}>{l.message}</span>
             </div>
           ))
         )}
