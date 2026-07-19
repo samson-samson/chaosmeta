@@ -121,12 +121,13 @@ type injectExecutor struct {
 
 func (e *injectExecutor) Name() (string, error) { return e.name, nil }
 
-func (e *injectExecutor) GetStatus(ctx context.Context, namespace, name string) (string, error) {
+func (e *injectExecutor) GetStatus(ctx context.Context, namespace, name string) (string, string, error) {
 	cr, err := e.svc.Get(ctx, namespace, name)
 	if err != nil || cr == nil {
-		return "", err // absent/unreadable → reconciler treats "" as not-yet-statused
+		return "", "", err // absent/unreadable → reconciler treats "" as not-yet-statused
 	}
-	return string(cr.Status.Status), nil
+	// fault CR carries Phase: return both so isCRStatusClean can enforce phase==recover (P1-1).
+	return string(cr.Status.Phase), string(cr.Status.Status), nil
 }
 
 func (e *injectExecutor) Create(ctx context.Context) (string, error) {
@@ -151,12 +152,13 @@ type flowExecutor struct {
 
 func (e *flowExecutor) Name() (string, error) { return e.name, nil }
 
-func (e *flowExecutor) GetStatus(ctx context.Context, namespace, name string) (string, error) {
+func (e *flowExecutor) GetStatus(ctx context.Context, namespace, name string) (string, string, error) {
 	cr, err := e.svc.Get(ctx, namespace, name)
 	if err != nil || cr == nil {
-		return "", err
+		return "", "", err
 	}
-	return string(cr.Status.Status), nil
+	// flow CR has no Phase field → phase ""; status alone is the clean signal (P1-1).
+	return "", string(cr.Status.Status), nil
 }
 
 func (e *flowExecutor) Create(ctx context.Context) (string, error) {
@@ -181,12 +183,13 @@ type measureExecutor struct {
 
 func (e *measureExecutor) Name() (string, error) { return e.name, nil }
 
-func (e *measureExecutor) GetStatus(ctx context.Context, namespace, name string) (string, error) {
+func (e *measureExecutor) GetStatus(ctx context.Context, namespace, name string) (string, string, error) {
 	cr, err := e.svc.Get(ctx, namespace, name)
 	if err != nil || cr == nil {
-		return "", err
+		return "", "", err
 	}
-	return string(cr.Status.Status), nil
+	// measure CR has no Phase field → phase ""; status alone is the clean signal (P1-1).
+	return "", string(cr.Status.Status), nil
 }
 
 func (e *measureExecutor) Create(ctx context.Context) (string, error) {

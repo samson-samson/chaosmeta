@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	gyaml "github.com/ghodss/yaml"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -230,6 +231,13 @@ func (c *ChaosmetaService) DeleteExpiredList(ctx context.Context, namespace stri
 func (c *ChaosmetaService) Recover(namespace, name string) error {
 	chaosmetaCR, err := c.Get(context.Background(), namespace, name)
 	if err != nil {
+		// v5: a missing CR (NotFound) means the fault is already gone — recover is a no-op and must NOT
+		// surface as an error, otherwise the stop/confirm paths (which treat Recover errors as "unclean")
+		// would falsely report a residue over a CR that no longer exists. Other errors (e.g. transient
+		// API failures) still propagate so the caller can retry/alert.
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
 		log.Error(err)
 		return err
 	}

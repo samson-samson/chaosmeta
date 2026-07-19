@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	gyaml "github.com/ghodss/yaml"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -227,6 +228,11 @@ func (c *ChaosmetaFlowService) DeleteExpiredList(ctx context.Context, namespace 
 func (c *ChaosmetaFlowService) Recover(namespace, name string) error {
 	chaosmetaCR, err := c.Get(context.Background(), namespace, name)
 	if err != nil {
+		// v5: NotFound means the CR is already gone — recover is a no-op and must not surface as an
+		// error (stop/confirm treat Recover errors as "unclean" residue). Other errors still propagate.
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
 		log.Error(err)
 		return err
 	}

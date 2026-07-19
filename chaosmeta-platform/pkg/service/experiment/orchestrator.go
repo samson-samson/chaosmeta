@@ -46,8 +46,14 @@ type NodeExecutor interface {
 	// Name returns the chaosmeta CR name this node mints (same algorithm as the legacy Argo path, so
 	// stop/confirm reverse-lookup the same CR).
 	Name() (string, error)
-	// GetStatus returns the CR's status string, or "" if the CR is absent / not yet statused.
-	GetStatus(ctx context.Context, namespace, name string) (string, error)
+	// GetStatus returns the CR's (phase, status). phase is the chaosmeta CR's Spec/Status.Phase
+	// ("inject"/"recover" for fault experiments; "" for flow/measure which carry no Phase field).
+	// status is "" if the CR is absent / not yet statused. The reconciler uses phase to tell a fault
+	// that has merely FINISHED INJECTING (phase=inject,status=success) from one that has RECOVERED
+	// (phase=recover,status=success) — the former must NOT count as clean, or the next node starts
+	// while this fault is still resident (叠加注入). This mirrors the legacy Argo fault SuccessCondition
+	// "status.phase==recover,status.status==success" (experiment_custom_resource.go:105).
+	GetStatus(ctx context.Context, namespace, name string) (phase, status string, err error)
 	// Create creates the CR for the node. Implementations marshal their concrete CR struct.
 	Create(ctx context.Context) (string, error)
 	// Recover flips the named CR to recover phase. Must be idempotent w.r.t. an absent CR.
@@ -153,9 +159,15 @@ func (r *Reconciler) ReconcileInstance(instanceUUID string) (string, error) {
 // pollRunning checks a running node's CR and completes or fails it. Returns true iff the node became
 // succeeded this tick. Mutates node.Status in place so the caller's prevSucceeded tracking sees it.
 //
-// Empty status ("") is treated as "not yet statused" → leave running (do NOT falsely complete). The
-// legacy Argo success condition was an explicit `status.phase==recover,status.status==success`; we only
-// complete on an explicit clean terminal here.
+// Empty status ("") is treated as "not yet statused" → leave running (do NOT falsely complete).
+//
+// CRITICAL (Codex P1-1): a FAULT CR reports status=success as soon as the inject phase finishes
+// (chaosmeta-inject-operator inject handler), BEFORE recover flips it. The fault is still resident at
+// that point. We may only mark the node succeeded when the CR is genuinely clean — for faults that
+// means phase==recover && status∈{success,stopped} (mirrors the legacy Argo success condition). Marking
+// it succeeded earlier would let the strict-serial reconciler start the NEXT node while this fault is
+// still injected → 叠加注入. flow/measure CRs carry no Phase field (their SuccessCondition is just
+// status==success, inject is terminal) so they're clean on status alone.
 func (r *Reconciler) pollRunning(ctx context.Context, ns string, node *experimentInstanceModel.WorkflowNodeInstance) bool {
 	ex, err := r.newExecutor(node, RecoverPhaseType)
 	if err != nil {
@@ -169,13 +181,21 @@ func (r *Reconciler) pollRunning(ctx context.Context, ns string, node *experimen
 		node.Status = nodeStatusError
 		return false
 	}
-	st, _ := ex.GetStatus(ctx, ns, name)
+	phase, st, _ := ex.GetStatus(ctx, ns, name)
 	if isCRStatusFailed(st) {
 		_ = r.store.UpdateStatus(node.UUID, nodeStatusFailed, st)
 		node.Status = nodeStatusFailed
 		return false
 	}
-	if isCRStatusClean(st) {
+	// Issue recover FIRST (so the operator flips inject→recover) and only then treat success as clean.
+	// For fault nodes still in inject phase with status=success, issue Recover and leave the node
+	// running — the next tick will observe phase=recover,status=success and then complete it. This is
+	// the fix for P1-1: never complete a fault on an inject-phase success.
+	if ExecType(node.ExecType) == FaultExecType && st == string(SuccessStatusType) && phase != string(RecoverPhaseType) {
+		_ = ex.Recover(ns, name) // best-effort; ticker re-observes next tick even if this errors
+		return false             // still running — do not advance the chain
+	}
+	if isCRStatusClean(st, phase) {
 		if err := r.completeNode(ctx, ns, node, ex, name); err != nil {
 			_ = r.store.UpdateStatus(node.UUID, nodeStatusFailed, err.Error())
 			node.Status = nodeStatusFailed
@@ -267,9 +287,12 @@ func (r *Reconciler) ConfirmRecoverByDB(instanceUUID string) []string {
 			continue
 		}
 		name, _ := ex.Name()
-		st, _ := ex.GetStatus(ctx, ns, name)
-		if st == "" || isCRStatusClean(st) {
-			continue // absent or clean → recovered
+		phase, st, _ := ex.GetStatus(ctx, ns, name)
+		if st == "" {
+			continue // absent CR → already GC'd after recover, treat as clean
+		}
+		if isCRStatusClean(st, phase) {
+			continue // clean terminal → recovered
 		}
 		unclean = append(unclean, name)
 	}
@@ -282,10 +305,27 @@ func DriverPhaseFor(node *experimentInstanceModel.WorkflowNodeInstance) PhaseTyp
 	return InjectPhaseType
 }
 
-// isCRStatusClean reports whether a chaosmeta CR status string is a clean terminal (recovered, no longer
-// injecting). Wraps the existing isCleanTerminal; conservative — unknown strings are NOT clean.
-func isCRStatusClean(s string) bool {
-	return isCleanTerminal(StatusType(s))
+// isCRStatusClean reports whether a chaosmeta CR is at a clean terminal (no longer injecting).
+//
+// Codex P1-1 fix: for FAULT experiments the CR has a Phase field. The inject operator sets
+// status=success as soon as the INJECT phase finishes — but the fault is still resident until the
+// RECOVER phase reaches a terminal. So a fault is only clean when phase==recover AND status is a clean
+// terminal. flow/measure CRs have no Phase (phase==""); their success is inject-terminal, so they're
+// clean on status alone (mirrors the legacy Argo SuccessCondition difference at
+// experiment_custom_resource.go:105 vs :121).
+func isCRStatusClean(s, phase string) bool {
+	if s == "" {
+		return false
+	}
+	if !isCleanTerminal(StatusType(s)) {
+		return false
+	}
+	// No phase carried (flow/measure) → status-terminal is sufficient.
+	if phase == "" {
+		return true
+	}
+	// Fault with a phase → require recover phase so an inject-phase success is NOT treated as clean.
+	return PhaseType(phase) == RecoverPhaseType
 }
 
 // isCRStatusFailed reports a failed CR status; used to short-circuit a running node into failed.
