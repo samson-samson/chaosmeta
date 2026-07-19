@@ -151,25 +151,29 @@ func StartExperiment(experimentID string, creatorName string) error {
 		return err
 	}
 
+	// v5 DB orchestration (see docs/design/fi-db-orchestration.md): the experiment is no longer driven
+	// by an Argo Workflow CR. The instance + its workflow_node_instance rows were created above by
+	// CreateExperimentInstance; reconciling now starts the first (strict-serial) node synchronously,
+	// and the background ticker (ReconcileRunningInstances) advances running nodes to succeeded/failed.
+	restConfig, err := getRunRestConfig()
+	if err != nil {
+		return err
+	}
+	status, rerr := NewDBReconciler(restConfig, config.DefaultRunOptIns.WorkflowNamespace).ReconcileInstance(experimentInstanceId)
+	if rerr != nil {
+		log.Error("reconcile start error:", rerr)
+		return rerr
+	}
+	// Persist the derived instance status so the UI/ticker see it immediately.
+	return experimentInstanceModel.UpdateExperimentInstanceStatus(experimentInstanceId, status, "")
+}
+
+// getRunRestConfig returns the cluster rest.Config used to build chaosmeta clients. Centralized so the
+// start/stop/reconcile paths share one GetRestConfig call and one error-handling shape.
+func getRunRestConfig() (*rest.Config, error) {
 	clusterService := cluster.ClusterService{}
 	_, restConfig, err := clusterService.GetRestConfig(context.Background(), config.DefaultRunOptIns.RunMode.Int())
-	if err != nil {
-		return err
-	}
-
-	argoWorkFlowCtl, err := NewArgoWorkFlowService(restConfig, config.DefaultRunOptIns.ArgoWorkflowNamespace)
-	if err != nil {
-		return err
-	}
-
-	nodes, err := experimentInstanceService.GetWorkflowNodeInstanceDetailList(experimentInstanceId)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-
-	_, err = argoWorkFlowCtl.Create(*GetWorkflowStruct(experimentInstanceId, nodes))
-	return err
+	return restConfig, err
 }
 
 func getInjectMessage(node v1alpha1.NodeStatus) string {
@@ -226,6 +230,8 @@ func getInjectMessage(node v1alpha1.NodeStatus) string {
 	return string(statusData)
 }
 
+// Deprecated: DB orchestration (v5) recovers via Reconciler.StopInstanceByDB / completeNode reading
+// the DB node rows; this Argo-NodeStatus-driven recover is no longer on the live path.
 func injectRecoverByArgo(node v1alpha1.NodeStatus, experimentStatus *string, restConfig *rest.Config) error {
 	injectType, isInject := getInjectSecondField(node.DisplayName)
 	if isInject {
@@ -277,43 +283,35 @@ func injectRecoverByArgo(node v1alpha1.NodeStatus, experimentStatus *string, res
 }
 
 func stopExperiment(experimentInstanceID string, experimentStatus *string, tolerateFailure bool) error {
-	clusterService := cluster.ClusterService{}
-	_, restConfig, err := clusterService.GetRestConfig(context.Background(), config.DefaultRunOptIns.RunMode.Int())
-	if err != nil {
-		return err
+	// Already-ended instance (succeeded) — nothing to stop. Kept from the Argo path so StopExperiment's
+	// callers keep the same "experiment has ended" contract.
+	instanceInfo, err := experimentInstanceModel.GetExperimentInstanceByUUID(experimentInstanceID)
+	if err != nil || instanceInfo == nil {
+		return fmt.Errorf("can not find experimentInstance")
 	}
-
-	argoWorkFlowCtl, err := NewArgoWorkFlowService(restConfig, config.DefaultRunOptIns.WorkflowNamespace)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-
-	workFlowGet, status, err := argoWorkFlowCtl.Get(getWorFlowName(experimentInstanceID))
-	if err != nil {
-		log.Error(err)
-		return nil
-	}
-
-	if status == WorkflowSucceeded {
+	if instanceInfo.Status == WorkflowSucceeded {
 		return errors.New("experiment has ended")
 	}
 
-	for _, node := range workFlowGet.Status.Nodes {
-		if err := injectRecoverByArgo(node, experimentStatus, restConfig); err != nil {
-			if !tolerateFailure {
-				log.Error(err)
-				return err
-			}
+	// v5 DB orchestration: recover is driven from the DB node rows, not from an Argo Workflow's
+	// NodeStatus. StopInstanceByDB issues Recover on every resident (running/succeeded) node and marks
+	// them stopped. tolerateFailure mirrors the legacy "best-effort vs hard-fail" knob.
+	restConfig, err := getRunRestConfig()
+	if err != nil {
+		if !tolerateFailure {
+			return err
 		}
+		log.Error("stopExperiment: get restConfig error:", err)
+		return nil
 	}
-
-	workFlowGet.Spec.Shutdown = v1alpha1.ShutdownStrategyStop
-	if _, err := argoWorkFlowCtl.Update(*workFlowGet); err != nil {
-		log.Error(err)
-		return err
+	if err := NewDBReconciler(restConfig, config.DefaultRunOptIns.WorkflowNamespace).StopInstanceByDB(experimentInstanceID); err != nil {
+		if !tolerateFailure {
+			return err
+		}
+		log.Error("stopExperiment: StopInstanceByDB error:", err)
 	}
-	return argoWorkFlowCtl.Delete(getWorFlowName(experimentInstanceID))
+	*experimentStatus = WorkflowSucceeded
+	return nil
 }
 
 func StopExperiment(experimentInstanceID string, tolerateFailure bool) error {
@@ -346,66 +344,32 @@ func StopExperiment(experimentInstanceID string, tolerateFailure bool) error {
 	return experimentInstanceModel.UpdateExperimentInstance(experimentInstanceInfo)
 }
 
-// confirmRecoverCompleted polls every fault (inject) CR referenced by the Argo workflow's nodes and
-// waits until each reports a clean terminal status (success/stopped) or timeout. Returns the display
-// names (== CR names) of nodes that did NOT reach a clean state (empty = all clean). This is the D9
-// backstop that gives the "stop" operation its safety guarantee: a clean terminal everywhere before
-// we claim stop succeeded.
+// confirmRecoverCompleted is the D9 backstop that gives the "stop" operation its safety guarantee:
+// before we claim stop succeeded, confirm every fault node's chaosmeta CR actually reached a clean
+// terminal state (absent counts as cleaned — it was GC'd after recover). Returns the names (== CR
+// names) of nodes NOT confirmed clean (empty = all clean).
 //
-// CR names are taken from workFlowGet.Status.Nodes[*].DisplayName (the same name used elsewhere to
-// Get/Recover the chaosmeta CR), NOT from the static instance node rows — the latter hold template
-// step names, not CR names.
+// v5 DB orchestration: it scans the DB node rows + reverse-lookups the chaosmeta CRs (see
+// ConfirmRecoverByDB), NOT Argo Workflow.Status.Nodes. The `timeout` keeps the legacy contract — poll
+// until clean or the deadline, so chaosmetad has time to finish the async recover flip.
 func confirmRecoverCompleted(experimentInstanceID string, timeout time.Duration) []string {
-	clusterService := cluster.ClusterService{}
-	_, restConfig, err := clusterService.GetRestConfig(context.Background(), config.DefaultRunOptIns.RunMode.Int())
+	restConfig, err := getRunRestConfig()
 	if err != nil {
 		log.Error("confirmRecoverCompleted: get restConfig error:", err)
 		return []string{"<rest-config-unavailable>"}
 	}
-
-	argoWorkFlowCtl, err := NewArgoWorkFlowService(restConfig, config.DefaultRunOptIns.ArgoWorkflowNamespace)
-	if err != nil {
-		log.Error("confirmRecoverCompleted: argo client error:", err)
-		return []string{"<argo-client-unavailable>"}
-	}
-
-	// The workflow may already have been deleted by stopExperiment; if so the CRs were already told to
-	// recover and we best-effort confirm by re-listing what remains. Argo Get failure => treat as cleaned.
-	workFlowGet, _, gerr := argoWorkFlowCtl.Get(getWorFlowName(experimentInstanceID))
-	if gerr != nil || workFlowGet == nil {
-		log.Info("confirmRecoverCompleted: workflow already removed; assuming recover order issued")
-		return nil
-	}
-
-	chaosmetaService := NewChaosmetaService(restConfig)
-	ns := config.DefaultRunOptIns.WorkflowNamespace
-
+	rec := NewDBReconciler(restConfig, config.DefaultRunOptIns.WorkflowNamespace)
 	deadline := time.Now().Add(timeout)
-	var unclean []string
-	for _, node := range workFlowGet.Status.Nodes {
-		injectType, isInject := getInjectSecondField(node.DisplayName)
-		if !isInject || injectType != string(FaultExecType) {
-			continue
+	for {
+		unclean := rec.ConfirmRecoverByDB(experimentInstanceID)
+		if len(unclean) == 0 {
+			return nil
 		}
-		clean := false
-		for time.Now().Before(deadline) {
-			cr, gerr := chaosmetaService.Get(context.Background(), ns, node.DisplayName)
-			if gerr != nil {
-				// CR absent after a recover order: treat as already cleaned / gc'd.
-				clean = true
-				break
-			}
-			if isCleanTerminal(cr.Status.Status) {
-				clean = true
-				break
-			}
-			time.Sleep(2 * time.Second)
+		if !time.Now().Before(deadline) {
+			return unclean
 		}
-		if !clean {
-			unclean = append(unclean, node.DisplayName)
-		}
+		time.Sleep(2 * time.Second)
 	}
-	return unclean
 }
 
 // persistStopLog writes a single log line to the persistence store (D11). Best-effort: a DB error
@@ -552,6 +516,13 @@ func (e *ExperimentRoutine) syncExperimentStatusByWorkflow(workflow v1alpha1.Wor
 	return nil
 }
 
+// SyncExperimentsStatus is the legacy Argo-era status sync. Deprecated for the DB-orchestrated path:
+// instance status is now driven by ReconcileRunningInstances (which advances DB node rows directly),
+// so this Argo-Workflow-status poller is no longer the source of truth. Kept (not deleted) to limit
+// blast radius and to serve any still-running Argo instances created before the v5 cutover; not
+// registered for new clusters once the DB ticker is the only driver.
+//
+// Deprecated: use ReconcileRunningInstances.
 func (e *ExperimentRoutine) SyncExperimentsStatus() {
 	clusterService := cluster.ClusterService{}
 	_, restConfig, err := clusterService.GetRestConfig(context.Background(), config.DefaultRunOptIns.RunMode.Int())
@@ -635,6 +606,42 @@ func (e *ExperimentRoutine) DeleteExecutedInstanceCR() {
 	log.Info("expired chaosmeta measure experiment have been deleted successfully.")
 }
 
+// ReconcileRunningInstances is the v5 DB-orchestration ticker. It scans every Running experiment
+// instance and drives its nodes forward one tick via ReconcileInstance. This is what makes a running
+// node's chaosmeta CR eventually flip to succeeded/failed without an Argo controller — StartExperiment
+// only starts the first node synchronously; this ticker advances the rest (and picks up instances that
+// survived a platform restart).
+//
+// Best-effort: a per-instance reconcile error is logged and skipped so one bad instance cannot stall
+// the whole ticker (extreme-case graceful degradation — see task extreme-case handling requirement).
+func (e *ExperimentRoutine) ReconcileRunningInstances() {
+	_, instances, err := experimentInstanceModel.ListExperimentsInstancesByStatus([]experimentInstanceModel.ExperimentInstanceStatus{experimentInstanceModel.Running, experimentInstanceModel.Pending})
+	if err != nil {
+		log.Error("ReconcileRunningInstances: list instances error:", err)
+		return
+	}
+	restConfig, err := getRunRestConfig()
+	if err != nil {
+		log.Error("ReconcileRunningInstances: get restConfig error:", err)
+		return
+	}
+	rec := NewDBReconciler(restConfig, config.DefaultRunOptIns.WorkflowNamespace)
+	for _, inst := range instances {
+		status, rerr := rec.ReconcileInstance(inst.UUID)
+		if rerr != nil {
+			log.Error("reconcile instance", inst.UUID, "error:", rerr)
+			continue
+		}
+		// Only persist a transition; leaving it Pending/Running unchanged avoids needless writes on the
+		// hot 3s ticker. A dirty write would just no-op at the DB.
+		if status != string(inst.Status) {
+			if err := experimentInstanceModel.UpdateExperimentInstanceStatus(inst.UUID, status, ""); err != nil {
+				log.Error("update instance", inst.UUID, "status error:", err)
+			}
+		}
+	}
+}
+
 func (e *ExperimentRoutine) Start() {
 	localCron := cron.New()
 	spec := "@every 3s"
@@ -644,6 +651,13 @@ func (e *ExperimentRoutine) Start() {
 		return
 	}
 	if err := localCron.AddFunc(spec, e.DealCronExperiment); err != nil {
+		log.Error(err)
+		return
+	}
+
+	// v5 DB orchestration: drive Running/Pending instances forward every tick (replaces Argo's
+	// SyncExperimentsStatus as the live-status driver for the DB-orchestrated path).
+	if err := localCron.AddFunc(spec, e.ReconcileRunningInstances); err != nil {
 		log.Error(err)
 		return
 	}

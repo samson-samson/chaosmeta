@@ -66,6 +66,13 @@ func getWorFlowName(experimentInstanceId string) string {
 	return experimentInstanceId
 }
 
+// GetWorkflowStruct builds the Argo Workflow CR. Deprecated as an entry point since v5 DB orchestration
+// (routine.go no longer creates Argo workflows; the DB reconciler drives nodes directly). The per-node
+// builders below (getFaultStep/getFlowStep/getMeasureStep) are STILL USED by orchestrator_prod.go to
+// construct the chaosmeta CR body — only the Argo DAGTask/Workflow shell around them is deprecated.
+//
+// Deprecated: not called on the live path; retained to limit blast radius. The CR-body construction
+// (getFaultStep et al.) remains the single source of truth for chaosmeta CR marshalling.
 func GetWorkflowStruct(experimentInstanceId string, nodes []*experiment_instance.WorkflowNodesDetail) *v1alpha1.Workflow {
 	var newWorkflow = v1alpha1.Workflow{
 		TypeMeta: metav1.TypeMeta{
